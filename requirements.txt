@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+pyarrow
+plotly
+openai
+imageio-ffmpeg
