@@ -66,9 +66,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_BEHAVIOR_DB = Path(
-    r"\\SynoINVIBE_Caze\INVIBE_team_Cazettes\data\database\full_db_all_rigs.feather"
-)
+DEFAULT_BEHAVIOR_DB = Path(r"F:\full_db_all_rigs.feather")
 DEFAULT_EPHYS_ROOT = Path(r"F:\coregistration_db")
 DEFAULT_OPENFIELD_ROOT = Path(r"F:\Behavior")
 DEFAULT_BEHAVIOR_METRICS_DB = Path(r"F:\behavior_metrics.sqlite")

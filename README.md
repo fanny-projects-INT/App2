@@ -14,7 +14,7 @@ python -m venv .venv
 
 Default sources:
 
-- behavior: `\\SynoINVIBE_Caze\INVIBE_team_Cazettes\data\database\full_db_all_rigs.feather`
+- behavior: `F:\full_db_all_rigs.feather`
 - ephys/Brainreg root: `F:\coregistration_db`
 - open field root: `F:\Behavior`
 
