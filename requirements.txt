@@ -8,3 +8,5 @@ pyarrow
 plotly
 openai
 imageio-ffmpeg
+ONE-api>=3.5,<4
+python-dotenv>=1.0,<2

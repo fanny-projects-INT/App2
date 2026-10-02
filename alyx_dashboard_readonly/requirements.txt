@@ -1,0 +1,4 @@
+pandas>=2.2,<3
+ONE-api>=3.5,<4
+python-dotenv>=1.0,<2
+streamlit>=1.37,<2

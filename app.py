@@ -14,6 +14,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow.feather as feather
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -36,6 +37,9 @@ try:
     import imageio_ffmpeg
 except ImportError:
     imageio_ffmpeg = None
+
+from alyx_info import render_info_view
+from ui_states import loading_mouse_markup, render_no_data
 
 from app_functions import (
     PROTOCOL_LABELS,
@@ -135,7 +139,8 @@ def inject_css():
             border-right: 1px solid {CARD_BORDER};
         }}
         .block-container {{
-            width: min(100%, 1600px);
+            /* Keep breathing room on laptop displays, even below the width cap. */
+            width: min(92%, 1600px);
             max-width: 1600px;
             box-sizing: border-box;
             overflow-x: clip;
@@ -754,7 +759,9 @@ def inject_css():
         @media (max-width: 700px) {{
             .navigation-flow-spacer {{ height: 22px; }}
             .block-container {{
+                width: 100%;
                 padding-left: 1rem;
+                padding-right: 1rem;
             }}
             .st-key-navigation_fixed_shell > div > div[data-testid="stHorizontalBlock"],
             .st-key-app_navigation div[data-testid="stHorizontalBlock"] {{
@@ -1320,16 +1327,9 @@ def load_behavior_video_index(path: str, signature):
     )
 
 
-@st.cache_data(show_spinner="Preparing behavioral replay...", max_entries=8)
-def load_behavior_video_session(
-    path: str,
-    signature,
-    mouse: str,
-    date: str,
-    version: str | None,
-    database_index: int | None = None,
-):
-    del signature
+@st.cache_resource(show_spinner=False, max_entries=1)
+def load_behavior_replay_table(path: str, signature):
+    """Share Arrow buffers; materialize only the selected session as Python arrays."""
     columns = [
         "Mouse_ID", "Date", "Version", "Timestamps", "Speed", "Position",
         "Bout for Timestamps", "Bout Start Times", "Onsite Acc Start Time",
@@ -1339,9 +1339,30 @@ def load_behavior_video_session(
         "Correct Bouts", "Error Bouts", "Missed Bouts", "Manual Reward Bouts",
         "Proba Switch by Bout", "Proba Reward by Bout", "Time to Switch Epochs",
     ]
-    dataframe = pd.read_feather(path, columns=columns)
-    dataframe["Mouse_ID"] = dataframe["Mouse_ID"].astype(str)
-    dataframe["Date"] = pd.to_datetime(dataframe["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    table = feather.read_table(path, columns=columns, memory_map=True)
+    identities = table.select(["Mouse_ID", "Date", "Version"]).to_pandas()
+    identities["Mouse_ID"] = identities["Mouse_ID"].astype(str)
+    identities["Date"] = pd.to_datetime(identities["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return table, identities
+
+
+@st.cache_data(show_spinner="Preparing behavioral replay...", max_entries=8)
+def load_behavior_video_session(
+    path: str,
+    signature,
+    mouse: str,
+    date: str,
+    version: str | None,
+    database_index: int | None = None,
+):
+    table, dataframe = load_behavior_replay_table(path, signature)
+
+    def session_values(selected):
+        position = dataframe.index.get_loc(selected.name)
+        row = table.slice(int(position), 1).to_pandas().iloc[0].to_dict()
+        row.update(selected.to_dict())
+        return row
+
     # The ephys pipeline stores the original Feather row index after scoring all
     # same-day candidates. Prefer that exact row; Version is a compatibility
     # fallback for alignments produced before behavior_database_index existed.
@@ -1356,7 +1377,7 @@ def load_behavior_video_session(
             and selected["Date"] == date
             and (version is None or str(selected["Version"]) == str(version))
         ):
-            return selected.to_dict()
+            return session_values(selected)
     if version is None:
         return None
     rows = dataframe[
@@ -1366,7 +1387,7 @@ def load_behavior_video_session(
     ]
     if rows.empty:
         return None
-    return rows.iloc[-1].to_dict()
+    return session_values(rows.iloc[-1])
 
 
 def ephys_behavior_selection(session_dir, probe):
@@ -2637,6 +2658,7 @@ def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, ses
     raise ValueError(f"Unknown plot: {plot_name}")
 
 
+@st.cache_data(show_spinner=False, ttl=60, max_entries=4)
 def discover_openfield_sessions(openfield_root: Path):
     """Discover OFT, LDT and SIT sessions without assuming a single folder layout."""
     columns = ["mouse", "assay", "date", "session_dir", "videos", "csv_files"]
@@ -2782,6 +2804,7 @@ def casefold_path(base: Path, *parts):
     return resolved
 
 
+@st.cache_data(show_spinner=False, ttl=60, max_entries=4)
 def discover_ibl_channel_locations(ephys_root: Path):
     rows_by_insertion = {}
     if not ephys_root.exists():
@@ -3176,13 +3199,19 @@ def load_probe_analysis(
             if spike_clusters_path.exists():
                 spike_clusters = np.load(spike_clusters_path, mmap_mode="r")
                 spike_count = min(len(spike_times), len(spike_clusters))
-                cluster_values = np.asarray(spike_clusters[:spike_count], dtype=int)
-                valid_cluster_values = cluster_values[
-                    (cluster_values >= 0) & (cluster_values < len(units))
-                ]
-                computed_spike_counts = np.bincount(
-                    valid_cluster_values, minlength=len(units)
-                )[:len(units)].astype(float)
+                # Bound temporary allocations even for recordings with millions of spikes.
+                computed_spike_counts = np.zeros(len(units), dtype=float)
+                for chunk_start in range(0, spike_count, 1_000_000):
+                    cluster_values = np.asarray(
+                        spike_clusters[chunk_start:min(chunk_start + 1_000_000, spike_count)],
+                        dtype=int,
+                    )
+                    valid_cluster_values = cluster_values[
+                        (cluster_values >= 0) & (cluster_values < len(units))
+                    ]
+                    computed_spike_counts += np.bincount(
+                        valid_cluster_values, minlength=len(units)
+                    )[:len(units)]
                 units["num_spikes"] = pd.to_numeric(
                     units["num_spikes"], errors="coerce"
                 ).fillna(pd.Series(computed_spike_counts, index=units.index))
@@ -3253,11 +3282,11 @@ def load_probe_analysis(
                                 & (regional_bins >= 0)
                                 & (regional_bins < regional_counts.shape[1])
                             )
-                            np.add.at(
-                                regional_counts,
-                                (region_rows[regional_valid], regional_bins[regional_valid]),
-                                1,
-                            )
+                            regional_counts += np.bincount(
+                                region_rows[regional_valid] * regional_counts.shape[1]
+                                + regional_bins[regional_valid],
+                                minlength=regional_counts.size,
+                            ).reshape(regional_counts.shape)
                         rows = np.full(len(chunk_clusters), -1, dtype=int)
                         rows[valid] = cluster_lookup[chunk_clusters[valid]]
                         time_bins = np.searchsorted(time_edges, chunk_times, side="right") - 1
@@ -3267,7 +3296,10 @@ def load_probe_analysis(
                             & (time_bins >= 0)
                             & (time_bins < counts.shape[1])
                         )
-                        np.add.at(counts, (rows[valid], time_bins[valid]), 1)
+                        counts += np.bincount(
+                            rows[valid] * counts.shape[1] + time_bins[valid],
+                            minlength=counts.size,
+                        ).reshape(counts.shape)
 
                     if len(replay_regions):
                         region_rates = regional_counts / regional_bin_s
@@ -3736,6 +3768,7 @@ def clip_line_to_brain(fitted, annotation_image, frame_cache, resolution_um=25.0
     return clipped, entry
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def build_probe_figure(
     tracks,
     brain_mesh,
@@ -3744,6 +3777,7 @@ def build_probe_figure(
     selected_probe=None,
     annotation_path=None,
     height=520,
+    annotation_signature=None,
 ):
     figure = go.Figure()
     vertices, faces = brain_mesh
@@ -4596,6 +4630,7 @@ def _build_probe_anatomy_region_bars(channels, units):
     return styled
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def build_probe_anatomy_figure(channels, units):
     """Probe regions at left and aligned region-level metric blocks at right."""
     channel_view = channels.dropna(subset=["depth_um"]).copy()
@@ -4730,6 +4765,7 @@ def build_probe_anatomy_figure(channels, units):
     return styled
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def build_activity_heatmap(activity_heatmap, bout_start_times=None, height=520):
     values = activity_heatmap["relative_activity"]
     figure = make_subplots(
@@ -4882,6 +4918,7 @@ def build_good_unit_raster(raster, bout_start_times=None):
     return figure
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def build_peri_bout_figure(peri_bout, height=300):
     time_s = peri_bout["time_s"]
     baseline_mask = (time_s >= -4) & (time_s <= -1)
@@ -5004,6 +5041,7 @@ def build_lick_svm_figure(svm_view):
     return styled
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def build_qc_figure(units):
     grouped_labels = units["bombcell_label"].astype(str).replace(
         {"non_soma_good": "non_soma", "non_soma_mua": "non_soma"}
@@ -6730,7 +6768,7 @@ def render_chatbot_view(selected_mouse=None):
 
 def render_home_view():
     if not BEHAVIOR_DB.exists():
-        st.error(f"Behavior database not found: {BEHAVIOR_DB}")
+        render_no_data()
         return
 
     dataframe = load_behavior_database(
@@ -6738,7 +6776,7 @@ def render_home_view():
     )
     dataframe = dataframe[dataframe["Mouse_ID"].apply(is_visible_mouse)].copy()
     if dataframe.empty:
-        st.warning("No behavioral metadata found.")
+        render_no_data()
         return
 
     ephys_inventory = (
@@ -6879,18 +6917,20 @@ def render_home_view():
 
 def render_behavior_view(view_mode, mouse_id=None):
     if not BEHAVIOR_DB.exists():
-        st.error(f"Behavior database not found: {BEHAVIOR_DB}")
-        st.info("Set APP_BEHAVIOR_DB to use another Feather file.")
+        render_no_data()
         return
 
     signature = source_signature(BEHAVIOR_DB)
     dataframe = load_behavior_database(str(BEHAVIOR_DB), signature)
     if dataframe.empty:
-        st.warning("No behavioral metadata found.")
+        render_no_data()
         return
 
     mouse_options = sorted(dataframe["Mouse_ID"].dropna().unique().tolist())
-    if mouse_id not in mouse_options:
+    if mouse_id is not None and mouse_id not in mouse_options:
+        render_no_data()
+        return
+    if mouse_id is None:
         latest_per_mouse = dataframe.groupby("Mouse_ID", dropna=False)["Date"].max().dropna()
         mouse_id = latest_per_mouse.idxmax() if not latest_per_mouse.empty else mouse_options[0]
 
@@ -7032,11 +7072,14 @@ def _render_openfield_view_legacy(mouse=None, inventory=None):
     if inventory is None:
         inventory = discover_openfield_sessions(OPENFIELD_ROOT)
     if inventory.empty:
-        st.warning(f"No open-field sessions found below {OPENFIELD_ROOT}")
+        render_no_data()
         return
 
     mouse_options = sorted(inventory["mouse"].unique().tolist())
-    if mouse not in mouse_options:
+    if mouse is not None and mouse not in mouse_options:
+        render_no_data()
+        return
+    if mouse is None:
         mouse = mouse_options[0]
     mouse_inventory = inventory[inventory["mouse"] == mouse].copy().sort_values("date")
     session_options = mouse_inventory["date"].tolist()
@@ -7872,11 +7915,14 @@ def render_openfield_view(mouse=None, inventory=None):
     if inventory is None:
         inventory = discover_openfield_sessions(OPENFIELD_ROOT)
     if inventory.empty:
-        st.warning(f"No OFT, LDT or SIT sessions found below {OPENFIELD_ROOT}")
+        render_no_data()
         return
 
     mouse_options = sorted(inventory["mouse"].unique().tolist())
-    if mouse not in mouse_options:
+    if mouse is not None and mouse not in mouse_options:
+        render_no_data()
+        return
+    if mouse is None:
         mouse = mouse_options[0]
     mouse_inventory = (
         inventory[inventory["mouse"] == mouse]
@@ -8069,18 +8115,20 @@ def render_openfield_view(mouse=None, inventory=None):
 
 def render_ephys_view(mouse=None, inventory=None):
     if not EPHYS_ROOT.exists():
-        st.error(f"Electrophysiology root not found: {EPHYS_ROOT}")
-        st.info("Set APP_EPHYS_ROOT to the folder containing the mouse directories.")
+        render_no_data()
         return
 
     if inventory is None:
         inventory = discover_ibl_channel_locations(EPHYS_ROOT)
     if inventory.empty:
-        st.warning(f"No IBL or Brainreg probe trajectories found below {EPHYS_ROOT}")
+        render_no_data()
         return
 
     mouse_options = sorted(inventory["mouse"].unique().tolist())
-    if mouse not in mouse_options:
+    if mouse is not None and mouse not in mouse_options:
+        render_no_data()
+        return
+    if mouse is None:
         mouse = mouse_options[0]
 
     mouse_inventory = inventory[inventory["mouse"] == mouse].copy()
@@ -8139,7 +8187,7 @@ def render_ephys_view(mouse=None, inventory=None):
     atlas_probe_options = sorted(
         selected_inventory[selected_inventory["date"] == atlas_session]["probe"].unique().tolist()
     )
-    atlas_probe_key = f"detail_probe_{atlas_session}"
+    atlas_probe_key = f"detail_probe_{mouse}_{atlas_session}"
     atlas_selected_probe = st.session_state.get(
         atlas_probe_key, atlas_probe_options[0] if atlas_probe_options else None
     )
@@ -8160,6 +8208,7 @@ def render_ephys_view(mouse=None, inventory=None):
                 selected_probe=atlas_selected_probe,
                 annotation_path=str(annotation_path) if annotation_path.exists() else None,
                 height=430,
+                annotation_signature=source_signature(annotation_path) if annotation_path.exists() else None,
             )
             st.plotly_chart(
                 atlas_figure,
@@ -8253,7 +8302,7 @@ def render_ephys_view(mouse=None, inventory=None):
         focus_session = st.session_state[selected_key]
         session_inventory = selected_inventory[selected_inventory["date"] == focus_session]
         probe_options = sorted(session_inventory["probe"].unique().tolist())
-        shared_probe_key = f"detail_probe_{focus_session}"
+        shared_probe_key = f"detail_probe_{mouse}_{focus_session}"
         if st.session_state.get(shared_probe_key) not in probe_options:
             st.session_state[shared_probe_key] = probe_options[0]
         focus_probe = st.session_state[shared_probe_key]
@@ -8486,71 +8535,14 @@ def render_ephys_view(mouse=None, inventory=None):
         ]
         dataframe_card(units[display_columns])
 
-    if False:  # Behavioral replay is rendered before probe-dependent sections.
-        if not BEHAVIOR_DB.exists():
-            st.info("Behavioral database unavailable for this replay.")
-        else:
-            behavior_signature = source_signature(BEHAVIOR_DB)
-            video_index = load_behavior_video_index(str(BEHAVIOR_DB), behavior_signature)
-            session_match = video_index[
-                (video_index["Mouse_ID"] == mouse) & (video_index["Date"] == focus_session)
-            ]
-            if session_match.empty:
-                st.info("No behavioral recording matches this ephys session.")
-            else:
-                version = str(session_match.iloc[-1]["Version"])
-                behavior_row = load_behavior_video_session(
-                    str(BEHAVIOR_DB), behavior_signature, mouse, focus_session, version
-                )
-                replay_payload = build_behavior_replay_payload(
-                    behavior_row, mouse, focus_session
-                ) if behavior_row is not None else None
-                if replay_payload is None:
-                    st.info("Position and speed signals are not available for this session.")
-                else:
-                    probe_activity_items = []
-                    for probe_row in session_inventory.itertuples(index=False):
-                        probe_name = str(probe_row.probe)
-                        if probe_name == focus_probe:
-                            probe_analysis = analysis
-                        else:
-                            probe_locations_path = Path(probe_row.path)
-                            probe_analysis = load_probe_analysis(
-                                str(probe_locations_path),
-                                probe_analysis_signature(
-                                    probe_locations_path,
-                                    probe_row.session_dir,
-                                    probe_name,
-                                ),
-                                probe_row.source,
-                                probe_row.session_dir,
-                                probe_name,
-                                behavior_on_site_arrivals.get(focus_session, np.array([])),
-                            )
-                        probe_activity_items.append(
-                            {
-                                "probe": probe_name,
-                                "regional_activity": probe_analysis.get("regional_activity"),
-                                "alignment": probe_analysis.get("alignment", {}),
-                            }
-                        )
-                    replay_payload = attach_ephys_to_replay(
-                        replay_payload, probe_activity_items,
-                    )
-                    components.html(
-                        build_behavior_replay_html(replay_payload),
-                        height=880 + 165 * max(1, len(probe_activity_items)),
-                        scrolling=False,
-                    )
-                    st.caption(
-                        "Measured position and speed · good-unit firing rates transformed with "
-                        "t_behavior = a × t_ephys + b · site deactivation at the triggering lick."
-                    )
 
 
-inject_css()
-
+page_loading = st.empty()
+info_quick_rerun = st.session_state.pop("_info_quick_rerun", False)
+if st.session_state.get(NAVIGATION_STATE_KEY) != "Info" or not info_quick_rerun:
+    page_loading.markdown(loading_mouse_markup(), unsafe_allow_html=True)
 try:
+    inject_css()
     if st.session_state.get(NAVIGATION_STATE_KEY) not in VIEW_OPTIONS:
         legacy_view = st.session_state.get("global_view")
         st.session_state[NAVIGATION_STATE_KEY] = (
@@ -8559,6 +8551,7 @@ try:
             else VIEW_OPTIONS[0]
         )
     prepared_inventory = None
+    navigation_dataframe = None
     prepared_openfield_inventory = None
     default_navigation_mouse = None
     selected_view = st.session_state[NAVIGATION_STATE_KEY]
@@ -8614,13 +8607,18 @@ try:
     if mouse_options and default_navigation_mouse not in mouse_options:
         default_navigation_mouse = mouse_options[0]
 
-    selected_mouse = None
+    available_mice = set(mouse_options)
+    global_mouse = st.session_state.get("global_mouse")
+    if global_mouse is not None and global_mouse not in mouse_options:
+        mouse_options = sorted([*mouse_options, global_mouse])
+
+    selected_mouse = global_mouse
     with mouse_column:
         if selected_view in {"Home", "Chatbot"}:
             pass
         elif mouse_options:
             global_mouse = st.session_state.get("global_mouse")
-            if global_mouse not in mouse_options:
+            if global_mouse is None:
                 global_mouse = default_navigation_mouse
                 st.session_state["global_mouse"] = global_mouse
             navigation_mouse_key = f"navigation_mouse_{selected_view.lower()}"
@@ -8662,9 +8660,11 @@ try:
     if selected_view == "Home":
         render_home_view()
     elif selected_view == "Info":
-        pass
+        render_info_view(selected_mouse, navigation_dataframe)
     elif selected_view == "Chatbot":
         render_chatbot_view(selected_mouse)
+    elif selected_mouse is not None and selected_mouse not in available_mice:
+        render_no_data()
     elif selected_view == "Openfield":
         render_openfield_view(selected_mouse, prepared_openfield_inventory)
     elif selected_view == "Electrophysiology":
@@ -8675,3 +8675,6 @@ try:
 except Exception as error:
     st.error("Application failed")
     st.exception(error)
+
+finally:
+    page_loading.empty()

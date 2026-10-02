@@ -54,3 +54,31 @@ The electrophysiology overview places a compact 3D atlas next to clickable
 session cards. Each card summarizes insertion type, expected probe target,
 good-unit count, and valid behavioral bouts. Clicking a card controls the
 details shown below: `Overview`, `Activity`, or `Units & QC`.
+
+## Responsiveness
+
+The Info tab shows Alyx information for the mouse selected in the navigation.
+Sign in there with your Alyx account to see its general profile and visual
+session cards. Refresh reloads the selected mouse; Log out clears the connection
+and fetched records from the browser session. Credentials
+can be entered interactively and the authentication token is not cached on disk.
+For automatic login, fill in the local `.streamlit/secrets.toml` file (ignored by Git):
+
+```toml
+[alyx]
+username = "your-alyx-username"
+password = "your-alyx-password"
+```
+
+Restart Streamlit after editing this file. The configured Alyx account is used
+for all visitors to the app; Log out disconnects only the current browser session.
+The connection uses `ALYX_URL` and `ALYX_LAB` from the environment or the supplied
+handoff defaults. Install `requirements.txt` to include ONE-api and python-dotenv.
+
+Ephys keeps Replay, Anatomy, Activity and Quality control on the same page.
+Atlas and analysis figures are cached with their inputs. Spike counting uses
+bounded chunks and vectorized bin accumulation to reduce memory and CPU cost.
+Behavioral replay reuses Arrow buffers and converts only the selected session
+to Python arrays, avoiding a full Feather reload for each session.
+Ephys and open-field inventories are cached for 60 seconds; new sessions become
+visible on the next interaction after that interval.
