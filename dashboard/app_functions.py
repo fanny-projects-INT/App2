@@ -60,6 +60,8 @@ COLORS = {
     "purple_main": PURPLE_MAIN,
 }
 
+MIN_TASK_CORRECT_BOUTS = 50
+
 PROTOCOL_COLORS = {
     1: (0.96, 0.88, 0.42),
     2: (0.56, 0.77, 1.00),
@@ -326,64 +328,43 @@ def prepare_mouse_dataframe(df):
 # =============================================================================
 # CORE ANALYSIS
 # =============================================================================
-def compute_failures(row):
+def _bout_event_counts(row):
+    """Count events using one grouping pass and binary searches per bout.
+
+    Preserve the original first/last sample bounds, including unsorted input,
+    duplicate event times, and NaN bout identifiers (which have no samples).
+    """
     timestamps = ensure_array(row.get("Timestamps"))
     bouts = ensure_array(row.get("Bout for Timestamps"))
-
     if len(timestamps) == 0 or len(bouts) == 0:
-        return []
+        return [], []
+    identifiers, first, inverse = np.unique(bouts, return_index=True, return_inverse=True)
+    last = np.full(len(identifiers), -1, dtype=np.int64)
+    np.maximum.at(last, inverse, np.arange(len(bouts)))
+    starts, ends = timestamps[first], timestamps[last]
+    valid = (identifiers == identifiers) & (starts <= ends)
+    rewarded = np.sort(np.asarray(flatten_nested_times(row.get("Times Rewarded Licks", [])), dtype=float))
+    non_rewarded = np.sort(np.asarray(flatten_nested_times(row.get("Times Non Rewarded Licks", [])), dtype=float))
+    rewarded = rewarded[~np.isnan(rewarded)]
+    non_rewarded = non_rewarded[~np.isnan(non_rewarded)]
+    left = np.searchsorted(rewarded, starts, side="left")
+    right = np.searchsorted(rewarded, ends, side="right")
+    rewards = np.where(valid, right - left, 0)
+    failure_left = np.searchsorted(non_rewarded, starts, side="left")
+    has_reward = valid & (rewards > 0)
+    failure_left[has_reward] = np.searchsorted(
+        non_rewarded, rewarded[right[has_reward] - 1], side="right"
+    )
+    failures = np.where(valid, np.searchsorted(non_rewarded, ends, side="right") - failure_left, 0)
+    return failures.tolist(), rewards.tolist()
 
-    rewarded = flatten_nested_times(row.get("Times Rewarded Licks", []))
-    non_rewarded = flatten_nested_times(row.get("Times Non Rewarded Licks", []))
 
-    failures = []
-    for b in np.unique(bouts):
-        mask = bouts == b
-        t_in = timestamps[mask]
-
-        if len(t_in) == 0:
-            failures.append(0)
-            continue
-
-        r_in = [t for t in rewarded if t_in[0] <= t <= t_in[-1]]
-        nr_in = [t for t in non_rewarded if t_in[0] <= t <= t_in[-1]]
-
-        if len(nr_in) == 0:
-            failures.append(0)
-            continue
-
-        if len(r_in) == 0:
-            failures.append(len(nr_in))
-        else:
-            last_r = max(r_in)
-            count = sum(1 for t in nr_in if t > last_r)
-            failures.append(count)
-
-    return failures
+def compute_failures(row):
+    return _bout_event_counts(row)[0]
 
 
 def count_reward_per_bout(row):
-    timestamps = ensure_array(row.get("Timestamps"))
-    bouts = ensure_array(row.get("Bout for Timestamps"))
-
-    if len(timestamps) == 0 or len(bouts) == 0:
-        return []
-
-    rewarded = flatten_nested_times(row.get("Times Rewarded Licks", []))
-
-    counts = []
-    for b in np.unique(bouts):
-        mask = bouts == b
-        t_in = timestamps[mask]
-
-        if len(t_in) == 0:
-            counts.append(0)
-            continue
-
-        r_in = [t for t in rewarded if t_in[0] <= t <= t_in[-1]]
-        counts.append(len(r_in))
-
-    return counts
+    return _bout_event_counts(row)[1]
 
 
 def count_licks(row, lick_type):
@@ -742,13 +723,17 @@ def plot_kde_failures_by_session(df, mouse, session_cmap, bandwidth_factor=0.8):
 
     valid_sessions = []
     for _, row in df_session.iterrows():
+        # Session eligibility follows the dashboard's base definition only:
+        # the number of True values in Correct Bouts.
+        if count_valid_bouts(row) < MIN_TASK_CORRECT_BOUTS:
+            continue
         failures = np.array(compute_failures(row), dtype=float)
         valid_mask = valid_bout_mask_from_row(row, target_len=len(failures))
         failures = failures[valid_mask]
         failures = failures[np.isfinite(failures)]
         failures = failures[failures > 0]
 
-        if len(failures) < 100:
+        if len(failures) < 2 or len(np.unique(failures)) < 2:
             continue
 
         valid_sessions.append((row["Date"], failures))
@@ -792,7 +777,7 @@ def plot_regression_rewards_failures_and_slope(
     session_cmap,
     max_reward=7,
     max_failure=30,
-    min_valid_bouts=100
+    min_correct_bouts=MIN_TASK_CORRECT_BOUTS
 ):
     df_session = df[
         (df["Mouse_ID"] == mouse) &
@@ -807,6 +792,9 @@ def plot_regression_rewards_failures_and_slope(
     valid_sessions = []
 
     for _, row in df_session.iterrows():
+        n_correct = count_valid_bouts(row)
+        if n_correct < min_correct_bouts:
+            continue
         failures = np.asarray(compute_failures(row), dtype=float)
         rewards = np.asarray(count_reward_per_bout(row), dtype=float)
 
@@ -827,10 +815,6 @@ def plot_regression_rewards_failures_and_slope(
         failures = failures[mask]
         rewards = rewards[mask]
 
-        n_valid = len(failures)
-        if n_valid < min_valid_bouts:
-            continue
-
         mask = rewards <= max_reward
         failures_cut = failures[mask]
         rewards_cut = rewards[mask]
@@ -847,7 +831,7 @@ def plot_regression_rewards_failures_and_slope(
 
         valid_sessions.append({
             "date": pd.to_datetime(row["Date"]),
-            "n_valid": n_valid,
+            "n_valid": n_correct,
             "slope": float(model.coef_[0]),
             "intercept": float(model.intercept_),
             "mean_failures": float(np.mean(failures_cut)),
@@ -875,7 +859,7 @@ def plot_regression_rewards_failures_and_slope(
             label=f"{sess['date'].strftime('%Y-%m-%d')} (n={sess['n_valid']})",
         )
 
-    ax_left.set_title(f"Mouse {mouse} - Reward vs failures", color=COLORS["navy"])
+    ax_left.set_title(f"Mouse {mouse} - Rewards vs consecutive failures", color=COLORS["navy"])
     ax_left.set_xlabel("Reward count", color=COLORS["navy"])
     ax_left.set_ylabel("Consecutive failures", color=COLORS["navy"])
     ax_left.set_xlim(1, max_reward)
@@ -936,7 +920,7 @@ def plot_regression_rewards_failures_and_slope(
             zorder=15,
         )
 
-    ax_right.set_title("Mean failures over time", color=COLORS["navy"])
+    ax_right.set_title("Mean consecutive failures over time", color=COLORS["navy"])
     ax_right.set_xlabel("Session date", color=COLORS["navy"])
     ax_right.set_ylabel("Mean consecutive failures", color=COLORS["navy"])
     ax_right.set_xticks(x_idx)

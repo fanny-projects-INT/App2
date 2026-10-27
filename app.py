@@ -7,19 +7,43 @@ import os
 import re
 import sqlite3
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.feather as feather
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from matplotlib.colors import LinearSegmentedColormap, to_hex, to_rgba
 from PIL import Image
+from dashboard import arena_metrics as _arena_metrics
+if getattr(_arena_metrics, "ARENA_METRICS_VERSION", 0) < 2:
+    import importlib
+    _arena_metrics = importlib.reload(_arena_metrics)
+
+from dashboard import probe_profile as _probe_profile
+if getattr(_probe_profile, "PROBE_PROFILE_VERSION", 0) < 4:
+    import importlib
+    _probe_profile = importlib.reload(_probe_profile)
+prepare_profile = _probe_profile.prepare_profile
+build_profile_figure = _probe_profile.build_profile_figure
+PROFILE_METRICS = _probe_profile.PROFILE_METRICS
+from dashboard import histology_resampling as _histology_resampling
+if getattr(_histology_resampling, "HISTOLOGY_RESAMPLING_VERSION", 0) < 3:
+    import importlib
+    _histology_resampling = importlib.reload(_histology_resampling)
+inverse_coordinates = _histology_resampling.inverse_coordinates
+original_registered_slice = _histology_resampling.original_registered_slice
+registered_preview_channels = _histology_resampling.registered_preview_channels
+brain_crop_bounds = _histology_resampling.brain_crop_bounds
+native_histology_info = _histology_resampling.native_histology_info
+native_histology_slice = _histology_resampling.native_histology_slice
+native_preview_channels = _histology_resampling.native_preview_channels
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import gaussian_kde
@@ -38,10 +62,33 @@ try:
 except ImportError:
     imageio_ffmpeg = None
 
-from alyx_info import render_info_view
-from ui_states import loading_mouse_markup, render_no_data
+from dashboard import ui_states as _ui_states
+if getattr(_ui_states, "UI_STATES_VERSION", 0) < 1:
+    import importlib
+    importlib.reload(_ui_states)
+from dashboard import alyx_info as _alyx_info
+# A running Streamlit server can retain this module across source updates.
+# Reload only when the newly required entry point is absent.
+if not hasattr(_alyx_info, "prefetch_recent_info") or getattr(_alyx_info, "INFO_UI_VERSION", 0) < 17:
+    import importlib
+    _alyx_info = importlib.reload(_alyx_info)
+render_info_view = _alyx_info.render_info_view
+prefetch_recent_info = _alyx_info.prefetch_recent_info
+from dashboard.ui_states import dashboard_tabs, render_no_data, data_prefetcher
+from dashboard import behavior_overview as _behavior_overview
+if getattr(_behavior_overview, "OVERVIEW_UI_VERSION", 0) < 19:
+    import importlib
+    _behavior_overview = importlib.reload(_behavior_overview)
+render_behavior_overview = _behavior_overview.render_behavior_overview
+render_behavior_progression_preview = _behavior_overview.render_progression_preview
+render_behavior_session_info = _behavior_overview.render_session_info
 
-from app_functions import (
+from dashboard import app_functions as _app_functions
+if not hasattr(_app_functions, "MIN_TASK_CORRECT_BOUTS"):
+    import importlib
+    _app_functions = importlib.reload(_app_functions)
+from dashboard.app_functions import (
+    MIN_TASK_CORRECT_BOUTS,
     PROTOCOL_LABELS,
     build_session_plot_bout_timeline,
     build_session_plot_failure_distribution,
@@ -65,7 +112,7 @@ from app_functions import (
 
 
 st.set_page_config(
-    page_title="Behavior & electrophysiology dashboard",
+    page_title="cazettes-lab",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -92,12 +139,12 @@ ALLEN_BREGMA_MLAPDV_UM = np.array([5739.0, 5400.0, 332.0])
 PROBE_TARGETS = {"probe00": "ALM", "probe01": "STR"}
 VIEW_OPTIONS = ["Home", "Overview", "Electrophysiology", "Openfield", "Info", "Chatbot"]
 VIEW_LABELS = {
-    "Home": "Home",
+    "Home": "Mice",
     "Overview": "Behavior",
-    "Openfield": "Openfield",
+    "Openfield": "Arena tests",
     "Electrophysiology": "Ephys",
     "Info": "Info",
-    "Chatbot": "Agent",
+    "Chatbot": "Chat",
 }
 DEFAULT_VIEW = os.getenv("APP_DEFAULT_VIEW", "Home")
 NAVIGATION_STATE_KEY = "app_active_view"
@@ -112,9 +159,16 @@ WHITE = "#FFFFFF"
 
 
 def inject_css():
-    st.markdown(
+    st.html(
         f"""
         <style>
+        [data-testid="stSpinner"], [data-testid="stSpinner"] > div,
+        [data-testid="stStatusWidget"], [data-testid="stStatusWidget"] > div {{
+            background: transparent !important;
+            box-shadow: none !important;
+        }}
+        /* Hide frames left by the former UI until an existing browser tab reloads. */
+        .dashboard-retained-frame {{ display:none !important; }}
         html, body, [data-testid="stAppViewContainer"] {{
             scrollbar-gutter: stable !important;
             max-width: 100vw !important;
@@ -154,16 +208,26 @@ def inject_css():
         /* The fixed Streamlit header is transparent but still overlays the top
            navigation. Remove the layer entirely so every pixel remains clickable. */
         header[data-testid="stHeader"] {{
-            display: none !important;
+            display: block !important;
             height: 0 !important;
             min-height: 0 !important;
+            background: transparent !important;
+            pointer-events: none !important;
+            overflow: visible !important;
+        }}
+        header[data-testid="stHeader"] [data-testid="stSidebarCollapsedControl"] {{
+            pointer-events: auto !important;
+            position: fixed !important;
+            top: 8px !important;
+            left: 8px !important;
+            z-index: 1001 !important;
         }}
         .sidebar-title {{
-            font-size: 1.4rem;
+            font-size: 1.16rem;
             font-weight: 800;
             color: {NAVY};
             text-align: center;
-            margin: 0 0 1.4rem 0;
+            margin: 0 0 .9rem 0;
             letter-spacing: 0.4px;
             line-height: 1.2;
         }}
@@ -176,6 +240,23 @@ def inject_css():
             margin: 8px auto 0 auto;
             border-radius: 2px;
         }}
+        section[data-testid="stSidebar"] .stButton > button {{
+            min-height: 38px !important;
+            border-radius: 9px !important;
+            justify-content: flex-start !important;
+            padding: 0 12px !important;
+            font-size: .86rem !important;
+            font-weight: 600 !important;
+        }}
+        .sidebar-mouse-label {{
+            margin: 16px 0 7px; color: {MUTED}; font-size: .70rem;
+            font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+        }}
+        .st-key-behavior_section_session_focus .quiet-metric {{ min-height:60px; gap:8px; padding:8px 4px; }}
+        .st-key-behavior_section_session_focus .quiet-metric-label {{ font-size:.73rem; }}
+        .st-key-behavior_section_session_focus .quiet-metric-value {{ font-size:.95rem; }}
+        .st-key-behavior_section_session_focus .behavior-subtitle {{ margin:0 0 14px; font-size:.85rem; }}
+        .st-key-behavior_section_session_focus [data-testid="stVerticalBlock"] {{ gap:26px !important; }}
         .page-title {{
             font-size: 1.95rem;
             font-weight: 700;
@@ -461,7 +542,9 @@ def inject_css():
         }}
         .st-key-home_mouse_grid {{
             position: relative;
-            padding-top: 62px;
+            padding: 0 !important;
+            background: transparent !important;
+            border: 0 !important;
         }}
         .home-summary-band {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); align-items:center; min-height:126px; }}
         .home-summary-block {{ min-width:0; min-height:92px; display:flex; align-items:center; justify-content:center; gap:16px; padding:8px 22px; border-left:1px solid rgba(115,137,157,.18); }}
@@ -480,12 +563,12 @@ def inject_css():
         .home-summary-legend span {{ white-space:nowrap; }}
         .home-summary-legend i {{ display:inline-block; width:8px; height:8px; margin-right:7px; border-radius:50%; }}
         .home-summary-legend b {{ color:#223248; font-weight:650; margin-right:3px; }}
-        .behavior-mouse-band {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); align-items:center; min-height:126px; }}
-        .behavior-mouse-block {{ min-width:0; min-height:92px; display:flex; align-items:center; justify-content:center; gap:16px; padding:8px 22px; border-left:1px solid rgba(115,137,157,.18); }}
+        .behavior-mouse-band {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); align-items:center; min-height:78px; }}
+        .behavior-mouse-block {{ min-width:0; min-height:58px; display:flex; align-items:center; justify-content:center; gap:12px; padding:5px 16px; border-left:1px solid rgba(115,137,157,.18); }}
         .behavior-mouse-block:first-child {{ border-left:0; }}
         .behavior-mouse-primary {{ text-align:center; line-height:1.05; }}
-        .behavior-mouse-primary strong {{ display:block; color:#223248; font-size:1.72rem; font-weight:650; letter-spacing:-.025em; }}
-        .behavior-mouse-primary span {{ display:block; margin-top:9px; color:#718094; font-size:.78rem; font-weight:550; letter-spacing:.035em; }}
+        .behavior-mouse-primary strong {{ display:block; color:#223248; font-size:1.28rem; font-weight:650; letter-spacing:-.02em; }}
+        .behavior-mouse-primary span {{ display:block; margin-top:5px; color:#718094; font-size:.68rem; font-weight:600; letter-spacing:.035em; }}
         .behavior-mouse-pie {{ width:78px; height:78px; flex:0 0 78px; border-radius:50%; box-shadow:inset 0 0 0 1px rgba(34,50,72,.08); }}
         .behavior-mouse-legend {{ display:flex; flex-direction:column; gap:7px; color:#536477; font-size:.76rem; line-height:1.05; }}
         .behavior-mouse-legend span {{ white-space:nowrap; }}
@@ -538,224 +621,29 @@ def inject_css():
             .openfield-metric-grid {{ grid-template-columns:1fr; }}
         }}
         .st-key-chatbot_shell {{
-            background: transparent !important;
-            border: 0 !important;
-            border-radius: 0;
-            padding: 0 0 88px 0;
-            box-sizing: border-box;
-            min-height: 0;
-        }}
-        .chatbot-heading {{
-            color: {NAVY};
-            font-size: 1.08rem;
-            font-weight: 720;
-            margin: 0 0 4px 0;
-        }}
-        .chatbot-description {{
-            color: {MUTED};
-            font-size: .86rem;
-            margin: 0 0 18px 0;
-        }}
-        .st-key-chatbot_shell div[data-testid="stChatMessage"] {{
-            background: #FFFFFF;
-            border: 1px solid #DCE5ED;
-            border-radius: 13px;
-            padding: 10px 13px;
-            min-height: 0 !important;
-            height: auto !important;
-        }}
-        .st-key-chatbot_shell div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {{
-            width: 86%;
-            margin-left: auto;
-            background: #FFFFFF;
-            border-color: #D7E1EA;
-        }}
-        .st-key-chatbot_shell div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {{
-            width: 94%;
-            margin-right: auto;
-            background: #FFFFFF;
-        }}
-        .st-key-chatbot_shell [data-testid="stSpinner"],
-        .st-key-chatbot_shell [data-testid="stSpinner"] > div,
-        .st-key-chatbot_shell [data-testid="stStatusWidget"],
-        .st-key-chatbot_shell [data-testid="stStatusWidget"] > div {{
-            background: transparent !important;
-            border: 0 !important;
-            box-shadow: none !important;
-        }}
-        .st-key-chatbot_shell div[data-testid="stElementContainer"]:has([data-testid="stSpinner"]),
-        .st-key-chatbot_shell div[data-testid="stElementContainer"]:has([data-testid="stStatusWidget"]) {{
-            background: transparent !important;
-            border: 0 !important;
-            box-shadow: none !important;
-        }}
-        .st-key-chatbot_shell div[data-testid="stChatInput"] {{
-            background: #FFFFFF !important;
-            border: 1px solid #D4DFE8 !important;
-            border-radius: 13px !important;
-            box-shadow: 0 2px 8px rgba(34,50,72,.05);
-            box-sizing: border-box;
-            position: fixed !important;
-            left: calc(50% - 102px) !important;
-            right: auto !important;
-            bottom: 18px !important;
-            transform: none !important;
-            width: min(calc(100vw - 320px), 1306px) !important;
-            transform: translateX(-50%) !important;
-            margin: 0 !important;
-            z-index: 1000 !important;
-            overflow: visible;
-        }}
-        .st-key-chatbot_shell div[data-testid="stChatInput"] > div,
-        .st-key-chatbot_shell div[data-testid="stChatInput"] textarea {{
-            background: #FFFFFF !important;
-            border-radius: 12px !important;
-        }}
-        .st-key-chatbot_controls {{
-            height: 0 !important;
-            min-height: 0 !important;
-            margin: 0 !important;
-            padding: 0 !important;
-        }}
-        .st-key-chatbot_controls div[data-testid="stHorizontalBlock"] {{
-            align-items: center;
-            gap: 8px;
-        }}
-        .st-key-chatbot_controls button {{
-            height: 38px !important;
-            min-height: 38px !important;
-            padding-top: 0 !important;
-            padding-bottom: 0 !important;
-            border-radius: 10px !important;
-        }}
-        .st-key-chatbot_clear {{
-            position: fixed !important;
-            right: max(194px, calc((100vw - 1234px) / 2)) !important;
-            bottom: 18px !important;
-            width: 56px !important;
-            height: 56px !important;
-            z-index: 1001 !important;
-            margin: 0 !important;
-        }}
-        .st-key-chatbot_clear button {{
-            width: 56px !important;
-            height: 56px !important;
-            min-height: 56px !important;
-            padding: 0 !important;
-            border-radius: 13px !important;
-            background: #FFFFFF !important;
-        }}
-        .st-key-chatbot_astra {{
-            position: fixed !important;
-            right: max(48px, calc((100vw - 1510px) / 2)) !important;
-            bottom: 18px !important;
-            width: 128px !important;
-            height: 56px !important;
-            z-index: 1001 !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            border: 0 !important;
-            border-radius: 0 !important;
-            background: transparent !important;
-            box-shadow: none !important;
-        }}
-        .st-key-chatbot_astra [data-testid="stToggle"] {{
-            width: 100% !important;
-            min-height: 0 !important;
-            margin: 0 !important;
-        }}
-        .st-key-chatbot_astra [data-testid="stToggle"] label {{
-            width: 100% !important;
-            margin: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            gap: 7px !important;
-            color: {NAVY} !important;
-            font-size: .70rem !important;
-            white-space: nowrap !important;
-        }}
-        .st-key-chatbot_astra [data-testid="stToggle"] label > div {{
-            flex: 0 0 auto !important;
-            width: auto !important;
-            margin: 0 !important;
-        }}
-        .st-key-chatbot_astra [data-testid="stWidgetLabel"],
-        .st-key-chatbot_astra [data-testid="stWidgetLabel"] p {{
-            width: auto !important;
-            flex: 0 0 auto !important;
-            margin: 0 !important;
-            text-align: center !important;
-        }}
-        .st-key-chatbot_controls div[data-testid="stSegmentedControl"] {{
-            width: 100%;
-        }}
-        .st-key-chatbot_controls div[data-testid="stSegmentedControl"] > div {{
-            width: 100%;
-            gap: 0 !important;
-        }}
-        .st-key-chatbot_controls div[data-testid="stSegmentedControl"] button {{
-            flex: 1 1 0;
-            border-radius: 0 !important;
-            margin-left: -1px;
-        }}
-        .st-key-chatbot_controls div[data-testid="stSegmentedControl"] button:first-child {{
-            margin-left: 0;
-            border-radius: 10px 0 0 10px !important;
-        }}
-        .st-key-chatbot_controls div[data-testid="stSegmentedControl"] button:last-child {{
-            border-radius: 0 10px 10px 0 !important;
-        }}
-        .st-key-chatbot_controls [data-testid="stToggle"] {{
-            min-height: 38px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: fit-content;
-            margin: 0 auto;
-        }}
-        .st-key-chatbot_controls [data-testid="stToggle"] label {{
-            margin-bottom: 0;
-            font-size: .84rem;
-            color: {NAVY};
-        }}
-        .chatbot-mode-label {{
-            color: {MUTED};
-            font-size: .62rem;
-            font-weight: 650;
-            line-height: 1;
-            text-align: center;
-            height: 9px;
-            margin: 0 0 3px 0;
-            width: max-content;
-            position: relative;
-            left: 50%;
-            transform: translateX(-50%);
-        }}
-        .chatbot-clear-spacer {{
-            height: 12px;
+            width:100% !important; max-width:1100px; margin:0 auto !important;
+            background:transparent !important; border:0 !important; padding:0;
         }}
         .st-key-chatbot_history {{
-            position: fixed !important;
-            top: 96px !important;
-            left: max(24px, calc((100vw - 1552px) / 2)) !important;
-            right: max(24px, calc((100vw - 1552px) / 2)) !important;
-            bottom: 88px !important;
-            width: auto !important;
-            margin: 0 !important;
-            height: auto !important;
-            min-height: 330px !important;
-            overflow-y: auto !important;
-            z-index: 10 !important;
+            height:calc(100dvh - 150px) !important; min-height:280px;
         }}
-        .st-key-chatbot_history div[data-testid="stVerticalBlockBorderWrapper"] {{
-            height: 100% !important;
-            min-height: 330px !important;
-            max-height: none !important;
+        .st-key-chatbot_shell [data-testid="stChatMessage"] {{
+            background:#FFFFFF; border:1px solid #DCE5ED; border-radius:13px;
+            padding:10px 13px;
         }}
+        .st-key-chatbot_shell [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {{
+            width:86%; margin-left:auto;
+        }}
+        .st-key-chatbot_shell [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {{
+            width:94%; margin-right:auto;
+        }}
+        .st-key-chatbot_controls [data-testid="stHorizontalBlock"] {{ align-items:center; }}
+        .st-key-chatbot_controls [data-testid="stChatInput"] {{
+            background:#FFFFFF; border:1px solid #D4DFE8; border-radius:13px;
+        }}
+        .st-key-chatbot_controls button {{ min-height:42px; border-radius:10px; }}
+        .st-key-chatbot_astra [data-testid="stToggle"] {{ display:flex; align-items:center; justify-content:center; }}
+        .st-key-chatbot_astra label {{ white-space:nowrap; }}
         @media (max-width: 700px) {{
             .navigation-flow-spacer {{ height: 22px; }}
             .block-container {{
@@ -776,26 +664,6 @@ def inject_css():
                 min-height: 50px !important;
                 padding: 0 5px !important;
                 font-size: .72rem !important;
-            }}
-            .st-key-chatbot_shell div[data-testid="stChatInput"] {{
-                left: 14px !important;
-                right: 218px !important;
-                width: auto !important;
-                bottom: 12px !important;
-            }}
-            .st-key-chatbot_clear {{
-                right: 152px !important;
-                bottom: 12px !important;
-            }}
-            .st-key-chatbot_astra {{
-                right: 14px !important;
-                bottom: 12px !important;
-            }}
-            .st-key-chatbot_history {{
-                top: 74px !important;
-                left: 14px !important;
-                right: 14px !important;
-                bottom: 82px !important;
             }}
         }}
         .st-key-home_mouse_grid div[class*="st-key-home_mouse_card_"] {{
@@ -1042,7 +910,17 @@ def inject_css():
             position: relative;
         }}
         .st-key-behavior_summary {{
-            padding: 18px 20px 20px 20px;
+            padding: 8px 16px 9px 16px;
+        }}
+        .st-key-atlas_session_panel,
+        div[class*="st-key-ephys_section_"],
+        div[class*="st-key-behavior_section_"] {{
+            padding: 14px 16px 16px 16px !important;
+        }}
+        .st-key-atlas_session_panel .section-card-title,
+        div[class*="st-key-ephys_section_"] .section-card-title,
+        div[class*="st-key-behavior_section_"] .section-card-title {{
+            display: none !important;
         }}
         div[class*="st-key-behavior_section_"] img {{
             border-radius: 12px;
@@ -1190,9 +1068,115 @@ def inject_css():
             border-radius: 10px !important;
             background: rgba(255,255,255,0.52) !important;
         }}
+        /* Shared dimensions for the navigation, summaries and section tabs. */
+        header[data-testid="stHeader"] {{
+            height:0 !important; min-height:0 !important;
+            overflow: visible !important; pointer-events: none !important;
+            background: transparent !important;
+        }}
+        header[data-testid="stHeader"] [data-testid="stSidebarCollapsedControl"] {{
+            pointer-events:auto !important;
+        }}
+        header[data-testid="stHeader"] [data-testid="stToolbar"],
+        [data-testid="stDecoration"] {{ display:none !important; }}
+        header[data-testid="stHeader"] button {{ pointer-events:none !important; }}
+        header[data-testid="stHeader"] [data-testid="stSidebarCollapsedControl"] button {{ pointer-events:auto !important; }}
+        /* Streamlit 1.63 places the reopen button inside its toolbar. */
+        header[data-testid="stHeader"] [data-testid="stToolbar"]:has([data-testid="stExpandSidebarButton"]) {{
+            display:flex !important; pointer-events:none !important;
+        }}
+        [data-testid="stExpandSidebarButton"] {{
+            position:fixed !important; top:6px !important; left:6px !important;
+            display:flex !important; visibility:visible !important;
+            pointer-events:auto !important; z-index:10000 !important;
+            min-width:32px !important; min-height:32px !important;
+            background:#F8FAFB !important; border-radius:8px !important;
+        }}
+        header[data-testid="stHeader"] button[data-testid="stExpandSidebarButton"] {{ pointer-events:auto !important; }}
+        [data-testid="stMain"]:has(~ section[data-testid="stSidebar"][aria-expanded="false"]) .block-container {{ padding-left:42px !important; }}
+        .block-container {{ padding-top: 0 !important; width: min(96%, 1600px); }}
+        .st-key-page_home {{ padding-top: 16px; }}
+        [data-testid="stMainBlockContainer"] > [data-testid="stVerticalBlock"] {{ gap:8px !important; }}
+        .sidebar-title::after {{ display: none !important; }}
+        section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding-left:0 !important; padding-right:0 !important; }}
+        section[data-testid="stSidebar"] .sidebar-title {{ padding:0 16px; margin-bottom:28px !important; }}
+        section[data-testid="stSidebar"] [data-testid="stButton"] {{ width:100% !important; }}
+        section[data-testid="stSidebar"] [data-testid="stSelectbox"] {{ padding:12px 16px 0 !important; }}
+        section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap: 0 !important; }}
+        section[data-testid="stSidebar"] .stButton > button {{
+            width: 100% !important; min-height: 44px !important;
+            border: 0 !important; border-radius: 0 !important;
+            margin: 0 !important; box-shadow: none !important;
+            background: transparent !important;
+        }}
+        section[data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+            background: #F04F47 !important; color: white !important;
+        }}
+        section[data-testid="stSidebar"] .stButton > button:hover {{ background: #FBE6E3 !important; }}
+        .home-summary-band, .behavior-mouse-band {{
+            min-height:78px !important; height:78px !important; box-sizing:border-box;
+            align-items:center !important; overflow:hidden;
+            background:rgba(255,255,255,.62); border-radius:13px; padding:10px 0;
+        }}
+        .behavior-mouse-band {{ grid-template-columns:1fr .8fr 1.7fr 1.2fr !important; }}
+        .behavior-mouse-primary strong {{ font-size:1.16rem; overflow-wrap:anywhere; }}
+        .behavior-mouse-block {{ box-sizing:border-box; }}
+        .behavior-mouse-legend {{ text-align:left; }}
+        .home-summary-block, .behavior-mouse-block {{
+            min-height:0 !important; height:58px !important; max-height:58px;
+            box-sizing:border-box; padding:0 12px !important; gap:10px !important;
+            align-items:center !important; justify-content:center !important;
+        }}
+        .home-summary-pie, .behavior-mouse-pie {{ width: 48px; height: 48px; flex: 0 0 48px; }}
+        .home-summary-icon {{ width: 42px; height: 42px; flex: 0 0 42px; border-radius: 12px; }}
+        .home-summary-icon svg {{ width: 25px; height: 25px; }}
+        .home-summary-mice strong, .home-summary-value strong {{ font-size: 1.28rem; }}
+        .home-summary-legend, .behavior-mouse-legend {{ gap: 4px; font-size: .69rem; }}
+        .st-key-home_summary, .st-key-behavior_summary {{
+            padding: 0 !important; border: 0 !important; border-radius: 13px;
+            background: transparent !important;
+        }}
+        .st-key-atlas_session_panel, div[class*="st-key-ephys_section_"],
+        div[class*="st-key-behavior_section_"] {{
+            padding: 0 !important; border: 0 !important;
+            border-radius: 0 !important; background: transparent !important;
+        }}
+        div[data-testid="stTabs"] [role="tablist"]::after {{
+            display:none !important;
+        }}
+        div[data-testid="stTabs"] [role="tablist"] {{
+            gap:30px !important; margin:0 0 16px !important;
+            height:48px !important; min-height:48px !important; flex-shrink:0 !important;
+            overflow-x:auto; position:relative; z-index:2;
+            box-sizing:border-box; overflow-anchor:none;
+        }}
+        div[data-testid="stTabs"] button[role="tab"] {{
+            flex-shrink:0 !important; padding:10px 12px !important;
+            min-height:44px !important; white-space:nowrap !important;
+            cursor:pointer !important; pointer-events:auto !important;
+        }}
+        div[data-testid="stTabs"] button[role="tab"],
+        div[data-testid="stTabs"] button[role="tab"] p {{
+            font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;
+            font-size:16px !important; font-weight:650 !important; line-height:1.35 !important;
+        }}
+        section[data-testid="stSidebar"][aria-expanded="true"] {{
+            width:200px !important; min-width:200px !important; max-width:200px !important;
+        }}
+        .uniform-summary {{
+            display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
+            height:78px; align-items:center; background:rgba(255,255,255,.62);
+            border-radius:13px; margin-bottom:16px;
+        }}
+        .uniform-summary-item {{ text-align:center; padding:6px 12px; min-width:0; }}
+        .uniform-summary-item strong {{ display:block; color:{NAVY}; font-size:1.16rem; overflow-wrap:anywhere; }}
+        .uniform-summary-item span {{ display:block; color:{MUTED}; font-size:.68rem; margin-top:5px; text-transform:uppercase; }}
+        @media(max-width:700px) {{
+            .home-summary-band,.behavior-mouse-band {{ height:auto; min-height:78px; grid-template-columns:repeat(2,minmax(0,1fr)) !important; }}
+            div[data-testid="stTabs"] [role="tablist"] {{ gap:20px !important; }}
+        }}
         </style>
         """,
-        unsafe_allow_html=True,
     )
 
 
@@ -1201,7 +1185,7 @@ def source_signature(path: Path):
     return stat.st_mtime_ns, stat.st_size
 
 
-@st.cache_resource(show_spinner="Loading behavioral database...", max_entries=1)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def load_behavior_database(path: str, signature):
     """Load the 750 MB Feather once and share the read-only DataFrame.
 
@@ -1220,6 +1204,117 @@ def load_behavior_database(path: str, signature):
         dataframe["Valid Bouts"] = dataframe.apply(count_valid_bouts, axis=1)
 
     return dataframe
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_behavior_catalog(path: str, signature):
+    """Small session index for navigation; never load signal arrays here."""
+    del signature
+    frame = pd.read_feather(path, columns=["Mouse_ID", "Date", "Version", "Protocol"])
+    frame["Mouse_ID"] = frame["Mouse_ID"].astype(str)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame["Version"] = frame["Version"].astype(str)
+    frame["Protocol"] = pd.to_numeric(frame["Protocol"], errors="coerce").astype("Int64")
+    return frame.sort_values(["Mouse_ID", "Date", "Version"])
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def load_info_behavior_metrics(path: str, signature, mouse_id: str):
+    """Load only the local scalar counters displayed by the Info session list."""
+    catalog = load_behavior_catalog(path, signature)
+    indices = catalog.index[catalog["Mouse_ID"] == str(mouse_id)].to_numpy()
+    columns = [
+        "Mouse_ID", "Date", "Version", "Number of Correct Bouts",
+        "Number of Rewarded Licks", "Number of Non Rewarded Licks",
+    ]
+    if not len(indices):
+        return pd.DataFrame(columns=[
+            "Mouse_ID", "Date", "Version", "valid_bouts",
+            "rewarded_licks", "unrewarded_licks",
+        ])
+    frame = read_behavior_rows(path, indices, columns=columns).to_pandas()
+    frame["Mouse_ID"] = frame["Mouse_ID"].astype(str)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame["Version"] = frame["Version"].astype(str)
+    return frame.rename(columns={
+        "Number of Correct Bouts": "valid_bouts",
+        "Number of Rewarded Licks": "rewarded_licks",
+        "Number of Non Rewarded Licks": "unrewarded_licks",
+    })
+
+
+def read_behavior_rows(path: str, indices, columns=None):
+    """Decode one column at a time and retain only the requested rows.
+
+    The source is a single compressed Feather record batch (>5 GB decoded).
+    Selecting rows after a full read retains all of it; selecting each column
+    separately keeps transient memory bounded to the largest source column.
+    """
+    if columns is None:
+        with pa.memory_map(path, "r") as source:
+            columns = pa.ipc.open_file(source).schema.names
+    selected_columns = []
+    for name in columns:
+        column = feather.read_table(path, columns=[name], memory_map=True)
+        selected_columns.append(column.take(indices).column(0))
+        del column
+    return pa.Table.from_arrays(selected_columns, names=columns)
+
+
+def mice_by_latest_session(frame, mouse_column="Mouse_ID", date_column="Date"):
+    """Newest session first, stable alphabetical ties, missing dates last."""
+    if frame.empty:
+        return []
+    dated = frame[[mouse_column, date_column]].dropna(subset=[mouse_column]).copy()
+    dated[mouse_column] = dated[mouse_column].astype(str)
+    dated = dated[dated[mouse_column].map(is_visible_mouse)]
+    dated[date_column] = pd.to_datetime(dated[date_column], errors="coerce")
+    latest = dated.groupby(mouse_column, sort=True)[date_column].max()
+    return latest.sort_values(ascending=False, kind="stable", na_position="last").index.tolist()
+
+
+def prepare_cached_behavior_frame(frame):
+    frame, _ = prepare_mouse_dataframe(frame)
+    if "Number of Valid Bouts" in frame.columns:
+        frame["Valid Bouts"] = frame["Number of Valid Bouts"]
+    elif "Valid Bouts" not in frame.columns:
+        frame["Valid Bouts"] = frame.apply(count_valid_bouts, axis=1)
+    return frame
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def load_recent_behavior_mice(path: str, signature):
+    """Pin the eight newest visible mice independently of browsing history."""
+    catalog = load_behavior_catalog(path, signature)
+    mice = mice_by_latest_session(catalog)[:8]
+    indices = catalog.index[catalog["Mouse_ID"].isin(mice)].to_numpy()
+    if not len(indices):
+        return {}
+    # Read the source only once for the entire recent group.
+    frame = read_behavior_rows(path, indices).to_pandas()
+    return {
+        mouse: prepare_cached_behavior_frame(frame[frame["Mouse_ID"].astype(str) == mouse])
+        for mouse in mice
+    }
+
+
+def load_older_behavior_mouse(path: str, signature, mouse_id: str):
+    """Load an older mouse on demand without retaining its prepared data."""
+    catalog = load_behavior_catalog(path, signature)
+    indices = catalog.index[catalog["Mouse_ID"] == mouse_id].to_numpy()
+    return prepare_cached_behavior_frame(read_behavior_rows(path, indices).to_pandas())
+
+
+def load_behavior_mouse(path: str, signature, mouse_id: str):
+    """Shared read-only frames; callers copy before assigning display columns.
+
+    Source signatures invalidate the recent group. Only the latest eight
+    mice are retained; older mice are loaded on demand.
+    """
+    catalog = load_behavior_catalog(path, signature)
+    if mouse_id in mice_by_latest_session(catalog)[:8]:
+        return load_recent_behavior_mice(path, signature)[mouse_id]
+    return load_older_behavior_mouse(path, signature, mouse_id)
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -1329,7 +1424,7 @@ def load_behavior_video_index(path: str, signature):
 
 @st.cache_resource(show_spinner=False, max_entries=1)
 def load_behavior_replay_table(path: str, signature):
-    """Share Arrow buffers; materialize only the selected session as Python arrays."""
+    """Cache replay identities, without retaining every session's signals."""
     columns = [
         "Mouse_ID", "Date", "Version", "Timestamps", "Speed", "Position",
         "Bout for Timestamps", "Bout Start Times", "Onsite Acc Start Time",
@@ -1337,16 +1432,21 @@ def load_behavior_replay_table(path: str, signature):
         "Time First Lick", "Time Last Lick", "Position First Lick", "Position Last Lick",
         "Times Rewarded Licks", "Times Non Rewarded Licks", "Times Invalid Licks",
         "Correct Bouts", "Error Bouts", "Missed Bouts", "Manual Reward Bouts",
+        "Rewards", "Licks After",
         "Proba Switch by Bout", "Proba Reward by Bout", "Time to Switch Epochs",
     ]
-    table = feather.read_table(path, columns=columns, memory_map=True)
-    identities = table.select(["Mouse_ID", "Date", "Version"]).to_pandas()
+    with pa.memory_map(path, "r") as source:
+        available_columns = set(pa.ipc.open_file(source).schema.names)
+    columns += [name for name in (
+        "Protocol", "Probas", "Session Dur", "Number of Bouts", "Number of Rewarded Licks",
+    ) if name in available_columns]
+    identities = pd.read_feather(path, columns=["Mouse_ID", "Date", "Version"])
     identities["Mouse_ID"] = identities["Mouse_ID"].astype(str)
     identities["Date"] = pd.to_datetime(identities["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    return table, identities
+    return columns, identities
 
 
-@st.cache_data(show_spinner="Preparing behavioral replay...", max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=8)
 def load_behavior_video_session(
     path: str,
     signature,
@@ -1355,11 +1455,17 @@ def load_behavior_video_session(
     version: str | None,
     database_index: int | None = None,
 ):
-    table, dataframe = load_behavior_replay_table(path, signature)
+    """Load replay signals and session-plot metrics for the selected behavior row."""
+    columns, dataframe = load_behavior_replay_table(path, signature)
+    # Include the session summary in this loader's cache identity as well as signals.
+    summary_columns = ("Protocol", "Probas", "Session Dur", "Number of Bouts", "Number of Rewarded Licks")
+    with pa.memory_map(path, "r") as source:
+        names = set(pa.ipc.open_file(source).schema.names)
+    columns = list(dict.fromkeys([*columns, *(name for name in summary_columns if name in names)]))
 
     def session_values(selected):
         position = dataframe.index.get_loc(selected.name)
-        row = table.slice(int(position), 1).to_pandas().iloc[0].to_dict()
+        row = read_behavior_rows(path, [int(position)], columns).to_pandas().iloc[0].to_dict()
         row.update(selected.to_dict())
         return row
 
@@ -1388,6 +1494,29 @@ def load_behavior_video_session(
     if rows.empty:
         return None
     return session_values(rows.iloc[-1])
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def load_ephys_behavior_events(path, signature, mouse, date, version, database_index):
+    _, identities = load_behavior_replay_table(path, signature)
+    selected = None
+    if database_index is not None and database_index in identities.index:
+        candidate = identities.loc[database_index]
+        if str(candidate["Mouse_ID"]) == str(mouse) and candidate["Date"] == date and (
+            version is None or str(candidate["Version"]) == str(version)
+        ):
+            selected = candidate
+    if selected is None and version is not None:
+        rows = identities[(identities["Mouse_ID"] == str(mouse)) & (identities["Date"] == date)
+                          & (identities["Version"].astype(str) == str(version))]
+        if not rows.empty:
+            selected = rows.iloc[-1]
+    if selected is None:
+        return None
+    position = identities.index.get_loc(selected.name)
+    return read_behavior_rows(path, [int(position)], [
+        "Correct Bouts", "Traveling Epochs", "Onsite Acc Start Time",
+    ]).to_pandas().iloc[0].to_dict()
 
 
 def ephys_behavior_selection(session_dir, probe):
@@ -1724,10 +1853,21 @@ def attach_ephys_to_replay(payload, probe_activity_items):
     return payload
 
 
-def build_behavior_replay_html(payload, behavior_only=False):
+def build_behavior_replay_html(payload, behavior_only=False, compact=False):
     replay_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
     safe_mouse = html.escape(payload["mouse"])
     safe_date = html.escape(payload["date"])
+    controls = r"""
+        <div class="controls">
+          <button class="round-button" id="playButton" aria-label="Play">▶</button>
+          <input id="scrubber" type="range" min="0" step="0.01" value="0">
+          <div class="time" id="clock">00:00 / 00:00</div>
+          <select id="playbackRate" aria-label="Playback speed">
+            <option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option>
+            <option value="10">10×</option><option value="20">20×</option><option value="50">50×</option>
+          </select>
+        </div>
+    """
     template = r"""
     <!doctype html>
     <html lang="en">
@@ -1792,6 +1932,24 @@ def build_behavior_replay_html(payload, behavior_only=False):
         .legend { display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap; color:#667384; font-size:9px; margin:0; }
         .legend i { width:6px; height:6px; border-radius:50%; display:inline-block; margin-right:3px; vertical-align:0; }
         .controls { margin-top:24px; padding:4px 0 0; display:grid; grid-template-columns:auto minmax(180px,1fr) auto auto; gap:14px; align-items:center; background:transparent; border:0; border-radius:0; }
+        .replay-view-tabs { display:flex; gap:24px; margin:0 0 18px; }
+        .replay-view-tabs button { border:0; background:transparent; padding:9px 5px; color:#748091; cursor:pointer; font-weight:650; border-bottom:2px solid transparent; }
+        .replay-view-tabs button.active { color:#F04F47; border-bottom-color:#F04F47; }
+        .replay-view-tabs { display:none; }
+        .replay-shell:not(.behavior-only) .stage-card,
+        .replay-shell:not(.behavior-only) #scene,
+        .replay-shell:not(.behavior-only) .spike-probes,
+        .replay-shell:not(.behavior-only) .spike-probe,
+        .replay-shell:not(.behavior-only) .spike-probe canvas,
+        .replay-shell:not(.behavior-only) .brain-atlas,
+        .replay-shell:not(.behavior-only) .brain-atlas-plot { height:210px; }
+        .replay-shell:not(.behavior-only) .atlas-plane-slider { height:185px; }
+        .replay-shell:not(.behavior-only) .timeline-stack { margin-top:18px; }
+        .replay-shell:not(.behavior-only) .timeline-column,
+        .replay-shell:not(.behavior-only) #neuralPlots { row-gap:14px; }
+        .replay-shell:not(.behavior-only) .trace-title { margin-bottom:10px; }
+        .replay-shell:not(.behavior-only) .timeline-canvas { height:100px !important; }
+        .replay-shell:not(.behavior-only) .controls { margin-top:12px; }
         .behavior-side-item { display:none; }
         .behavior-only .top-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:28px; }
         .behavior-only .histology-item { display:none; }
@@ -1805,6 +1963,71 @@ def build_behavior_replay_html(payload, behavior_only=False):
         .behavior-only .behavior-side-slot #eventTimeline { height:112px; }
         .behavior-only .behavior-side-slot #speedTimeline { height:112px; }
         .behavior-only .controls { margin-top:22px; }
+        .behavior-only.compact .top-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:32px; }
+        .behavior-only.compact .stage-card,.behavior-only.compact #scene { height:235px; }
+        .behavior-only.compact .behavior-side-slot #eventTimeline,
+        .behavior-only.compact .behavior-side-slot #speedTimeline { height:100px; }
+        .behavior-only.compact .trace-title { margin-bottom:8px; font-size:10px; }
+        .behavior-only.compact .behavior-side-slot .timeline-column { grid-template-columns:minmax(0,1fr); row-gap:12px; }
+        .behavior-only.compact .controls { margin-top:12px; gap:12px; grid-template-columns:32px minmax(60px,1fr) 80px 48px; }
+        .behavior-only.compact .round-button,.behavior-only.compact select { height:32px; }
+        .behavior-only.compact .round-button { width:32px; }
+        .behavior-only.compact .time { min-width:0; font-size:10px; }
+        @media(max-width:850px) { .behavior-only.compact .top-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .behavior-only.compact .behavior-side-slot .timeline-column { grid-template-columns:minmax(0,1fr); } }
+        .replay-shell:not(.behavior-only) .top-grid { grid-template-columns:minmax(0,1.2fr) minmax(0,2fr); gap:24px; }
+        .replay-shell:not(.behavior-only) .behavior-side-item { display:block; }
+        .replay-shell:not(.behavior-only) .behavior-side-slot .timeline-column { grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:24px; }
+        @media(max-width:850px) {
+          .replay-shell:not(.behavior-only) .top-grid { grid-template-columns:1fr; }
+          .replay-shell:not(.behavior-only) .behavior-side-slot .timeline-column { grid-template-columns:1fr; }
+        }
+        .replay-shell.compact:not(.behavior-only) .top-grid {
+          grid-template-columns:repeat(2,minmax(0,1fr)); gap:34px;
+        }
+        .replay-shell.compact:not(.behavior-only) .video-item { order:0; }
+        .replay-shell.compact:not(.behavior-only) .video-item,
+        .replay-shell.compact:not(.behavior-only) .histology-item {
+          display:grid; grid-template-rows:26px 200px 48px auto; align-content:start;
+        }
+        .replay-shell.compact:not(.behavior-only) .top-item > .trace-title { grid-row:1; }
+        .replay-shell.compact:not(.behavior-only) .stage-card,
+        .replay-shell.compact:not(.behavior-only) .spike-probes { grid-row:2; }
+        .replay-shell.compact:not(.behavior-only) .video-item > .controls { grid-row:3; }
+        .replay-shell.compact:not(.behavior-only) .video-item > .behavior-side-slot,
+        .replay-shell.compact:not(.behavior-only) .histology-item > #neuralPlots { grid-row:4; }
+
+        .replay-shell.compact:not(.behavior-only) .behavior-side-item { display:none; }
+        .replay-shell.compact:not(.behavior-only) .histology-item { order:2; }
+        .replay-shell.compact:not(.behavior-only) .stage-card { width:100%; margin-left:0; }
+        .replay-shell.compact:not(.behavior-only) .stage-card,
+        .replay-shell.compact:not(.behavior-only) #scene,
+        .replay-shell.compact:not(.behavior-only) .spike-probes,
+        .replay-shell.compact:not(.behavior-only) .spike-probe,
+        .replay-shell.compact:not(.behavior-only) .spike-probe canvas,
+        .replay-shell.compact:not(.behavior-only) .brain-atlas,
+        .replay-shell.compact:not(.behavior-only) .brain-atlas-plot { height:200px; }
+        .replay-shell.compact:not(.behavior-only) .spike-probes { width:100%; margin-left:0; gap:4px; justify-content:center; }
+        .replay-shell.compact:not(.behavior-only) .atlas-plane-slider { height:180px; }
+        .replay-shell.compact:not(.behavior-only) .behavior-side-slot .timeline-column { grid-template-columns:repeat(2,minmax(0,1fr)); gap:26px; }
+        .replay-shell.compact:not(.behavior-only) .video-item > .behavior-side-slot { margin-top:36px; }
+        .replay-shell.compact:not(.behavior-only) .timeline-stack { grid-template-columns:1fr; margin-top:32px; }
+        .replay-shell.compact:not(.behavior-only) #neuralPlots { grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:26px; margin-top:36px; }
+        .replay-shell.compact:not(.behavior-only) > .timeline-stack { display:none; }
+        .replay-shell.compact:not(.behavior-only) .brain-atlas { width:min(100%,278px); justify-self:start; }
+        .replay-shell.compact:not(.behavior-only) .trace-title { height:18px; line-height:18px; margin-bottom:8px; }
+        .replay-shell.compact:not(.behavior-only) .controls { margin-top:12px; gap:12px; grid-template-columns:32px minmax(60px,1fr) 80px 48px; }
+        .replay-shell.compact:not(.behavior-only) .round-button,
+        .replay-shell.compact:not(.behavior-only) select { height:32px; }
+        .replay-shell.compact:not(.behavior-only) .round-button { width:32px; }
+        .replay-shell.compact:not(.behavior-only) .time { min-width:0; font-size:10px; }
+        @media(max-width:850px) {
+          .replay-shell.compact:not(.behavior-only) .top-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+          .replay-shell.compact:not(.behavior-only) .histology-item { grid-column:auto; }
+        }
+        .replay-shell.compact:not(.behavior-only) .top-item { padding-top:2px; }
+        .replay-shell.compact:not(.behavior-only) .timeline-canvas { height:115px !important; }
+        .replay-shell.compact:not(.behavior-only) .neural-timeline { height:115px !important; }
+        .replay-shell.compact:not(.behavior-only) .timeline-card { padding:5px 4px; }
         button,select { font:inherit; }
         .round-button { width:38px; height:38px; border:0; border-radius:11px; color:white; background:var(--ink); cursor:pointer; font-size:15px; transition:transform .12s ease,background .12s ease; }
         .round-button:hover { transform:translateY(-1px); background:#314762; }
@@ -1824,6 +2047,10 @@ def build_behavior_replay_html(payload, behavior_only=False):
     </head>
     <body>
       <div class="replay-shell __MODE_CLASS__">
+        <div class="replay-view-tabs">
+          <button class="active" data-view="reconstruction">Reconstruction</button>
+          <button data-view="signals">Signals</button>
+        </div>
         <div class="top-grid">
           <div class="top-item video-item">
             <div class="trace-title"><strong>Behavior reconstruction</strong></div>
@@ -1831,6 +2058,7 @@ def build_behavior_replay_html(payload, behavior_only=False):
               <canvas id="scene"></canvas>
               <div class="event-toast" id="eventToast"></div>
             </div>
+            __VIDEO_CONTROLS__
           </div>
           <div class="top-item histology-item">
             <div class="trace-title"><strong>Histological view</strong></div>
@@ -1855,29 +2083,46 @@ def build_behavior_replay_html(payload, behavior_only=False):
           <div id="neuralPlots"></div>
         </div>
 
-        <div class="controls">
-          <button class="round-button" id="playButton" aria-label="Play">▶</button>
-          <input id="scrubber" type="range" min="0" step="0.01" value="0">
-          <div class="time" id="clock">00:00 / 00:00</div>
-          <select id="playbackRate" aria-label="Playback speed">
-            <option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option>
-            <option value="10">10×</option><option value="20">20×</option><option value="50">50×</option>
-          </select>
-        </div>
+        __GLOBAL_CONTROLS__
       </div>
 
       <script>
         const D = __DATA__;
         const replayShell = document.querySelector('.replay-shell');
+        // Grow the ephys iframe with its content rather than creating an inner scrollbar.
+        if (!replayShell.classList.contains('behavior-only')) {
+          const resizeReplayFrame = () => {
+            if (window.frameElement) {
+              window.frameElement.style.height = `${Math.ceil(replayShell.getBoundingClientRect().height) + 12}px`;
+            }
+          };
+          new ResizeObserver(resizeReplayFrame).observe(replayShell);
+        }
+        document.querySelectorAll('.replay-view-tabs button').forEach(button => {
+          button.addEventListener('click', () => {
+            replayShell.classList.toggle('signals-view', button.dataset.view === 'signals');
+            document.querySelectorAll('.replay-view-tabs button').forEach(item => item.classList.toggle('active', item === button));
+            window.dispatchEvent(new Event('resize'));
+          });
+        });
         const behaviorSideSlot = document.getElementById('behaviorSideSlot');
-        if (replayShell.classList.contains('behavior-only') && behaviorSideSlot) {
+        if (behaviorSideSlot) {
           const behaviorColumn = document.querySelector('.timeline-stack .timeline-column');
           if (behaviorColumn) behaviorSideSlot.appendChild(behaviorColumn);
+        }
+        if (!replayShell.classList.contains('behavior-only') && !replayShell.classList.contains('compact')) {
+          document.querySelector('.timeline-stack').prepend(document.querySelector('.histology-item'));
+        }
+        if(replayShell.classList.contains('compact')&&!replayShell.classList.contains('behavior-only')) {
+          document.querySelector('.video-item').appendChild(behaviorSideSlot);
         }
         const scene = document.getElementById('scene');
         const speedTimeline = document.getElementById('speedTimeline');
         const eventTimeline = document.getElementById('eventTimeline');
         const neuralPlots = document.getElementById('neuralPlots');
+        if(replayShell.classList.contains('compact')&&!replayShell.classList.contains('behavior-only')) {
+          document.querySelector('.histology-item').appendChild(neuralPlots);
+        }
         const spikeProbes = document.getElementById('spikeProbes');
         const scrubber = document.getElementById('scrubber');
         const playButton = document.getElementById('playButton');
@@ -1893,7 +2138,11 @@ def build_behavior_replay_html(payload, behavior_only=False):
         const REGION_COLORS=['#8B75C9','#48B8D0','#D17A5C','#54A986','#C08A45','#C45E86'];
         const neuralViews=[], spikeViews=[];
         const probeActivities=D.probeActivities||[];
-        spikeProbes.style.gridTemplateColumns=`${probeActivities.map(()=>"44px").join(" ")} minmax(220px,1fr)`;
+        if(replayShell.classList.contains('compact')&&!replayShell.classList.contains('behavior-only')) {
+          spikeProbes.style.gridTemplateColumns=`${probeActivities.map(()=>"44px").join(" ")} minmax(0,278px)`;
+        } else {
+          spikeProbes.style.gridTemplateColumns=`${probeActivities.map(()=>"44px").join(" ")} minmax(0,1fr)`;
+        }
         probeActivities.forEach((activity,probeIndex)=>{
           const view=document.createElement('div');view.className='timeline-card probe-neural';
           const head=document.createElement('div');head.className='trace-title';
@@ -1917,6 +2166,9 @@ def build_behavior_replay_html(payload, behavior_only=False):
         spikeProbes.appendChild(atlasCard);
 
         function canvasContext(canvas, height) {
+          if(!replayShell.classList.contains('behavior-only')) height=height===270?(replayShell.classList.contains('compact')?200:210):(replayShell.classList.contains('compact')?115:100);
+          else if(replayShell.classList.contains('compact')) height=height===270?235:100;
+          if(replayShell.classList.contains('compact')&&!replayShell.classList.contains('behavior-only')&&canvas.classList.contains('neural-timeline')) height=115;
           const width = Math.max(10, canvas.getBoundingClientRect().width);
           const ratio = Math.min(window.devicePixelRatio || 1, 2);
           const wantedW = Math.round(width * ratio), wantedH = Math.round(height * ratio);
@@ -2051,7 +2303,7 @@ def build_behavior_replay_html(payload, behavior_only=False):
         function drawEventTimeline(t){const {ctx,width:w,height:h}=canvasContext(eventTimeline,135),left=TIMELINE_LEFT,right=TIMELINE_RIGHT,top=4,bottom=19,plotW=w-left-right,plotH=h-top-bottom,{start,end}=timelineWindow(t),lanes=[['Arrival (site entry)',D.arrivals,COLORS.arrival,true],['Rewarded lick',D.rewardedLicks,COLORS.rewarded,false],['Non-rewarded',D.nonrewardedLicks,COLORS.nonrewarded,false],['Invalid lick',D.invalidLicks,COLORS.invalid,false],['Site deactivation',D.switches,COLORS.switched,true]],laneH=plotH/lanes.length;ctx.clearRect(0,0,w,h);lanes.forEach((lane,index)=>{const y=top+index*laneH;ctx.fillStyle=index%2?'rgba(116,128,145,.035)':'rgba(116,128,145,.065)';rounded(ctx,left,y+1,plotW,laneH-2,4).fill();ctx.fillStyle=lane[2];ctx.font='700 9px Inter, sans-serif';ctx.textAlign='right';ctx.fillText(lane[0],left-9,y+laneH*.66);for(const item of visibleEvents(lane[1],start,end,lane[3])){const value=lane[3]?item.t:item,x=left+(value-start)/(end-start)*plotW;ctx.strokeStyle=lane[2];ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(x,y+3);ctx.lineTo(x,y+laneH-4);ctx.stroke();}});drawCursor(ctx,t,start,end,left,plotW,top,plotH);drawTimeLabels(ctx,start,end,left,plotW,h);}
         function drawNeuralTimeline(t){
           neuralViews.forEach(({canvas,activity})=>{
-            const {ctx,width:w,height:h}=canvasContext(canvas,145),left=TIMELINE_LEFT,right=TIMELINE_RIGHT,top=7,bottom=21,plotW=w-left-right,plotH=h-top-bottom,{start,end}=timelineWindow(t);
+            const {ctx,width:w,height:h}=canvasContext(canvas,145),left=replayShell.classList.contains('compact')?54:TIMELINE_LEFT,right=TIMELINE_RIGHT,top=7,bottom=21,plotW=w-left-right,plotH=h-top-bottom,{start,end}=timelineWindow(t);
             ctx.clearRect(0,0,w,h);
             if(!activity.time.length){ctx.fillStyle='#8290A0';ctx.font='600 12px Inter, sans-serif';ctx.textAlign='center';ctx.fillText('Regional activity unavailable',w/2,h/2);return;}
             const names=Object.keys(activity.regions),time=activity.time,zMin=-5,zMax=5;
@@ -2095,7 +2347,7 @@ def build_behavior_replay_html(payload, behavior_only=False):
         function drawBrainAtlas(t){
           const {ctx,width:w,height:h}=canvasContext(atlasCanvas,270),slices=((D.atlasSlices||{}).slices||[]);
           ctx.clearRect(0,0,w,h);if(!slices.length)return;
-          const slice=slices[Math.max(0,Math.min(slices.length-1,Number(atlasSlider.value)))],atlasTop=6,atlasBottom=20,scale=Math.min(w/274,(h-atlasTop-atlasBottom)/192),drawW=274*scale,drawH=192*scale,drawX=(w-drawW)/2,drawY=atlasTop+(h-atlasTop-atlasBottom-drawH)/2;
+          const slice=slices[Math.max(0,Math.min(slices.length-1,Number(atlasSlider.value)))],atlasTop=6,atlasBottom=20,scale=Math.min(w/274,(h-atlasTop-atlasBottom)/192),drawW=274*scale,drawH=192*scale,drawX=replayShell.classList.contains('compact')&&!replayShell.classList.contains('behavior-only')?Math.min(4,Math.max(0,w-drawW)):(w-drawW)/2,drawY=atlasTop+(h-atlasTop-atlasBottom-drawH)/2;
           const base=atlasImage(slice.base);if(base&&base.complete)ctx.drawImage(base,drawX,drawY,drawW,drawH);
           Object.values(slice.masks||{}).forEach(url=>{
             const mask=atlasImage(url);if(!mask||!mask.complete)return;
@@ -2132,7 +2384,8 @@ def build_behavior_replay_html(payload, behavior_only=False):
           const pill=byId('stateNow');pill.textContent=state;pill.style.background=color;
         }
         function render(t) {
-          const sample=sampleAt(t);drawScene(t,sample);drawSpikeProbes(t);drawBrainAtlas(t);drawSpeedTimeline(t);drawEventTimeline(t);drawNeuralTimeline(t);
+          const sample=sampleAt(t);
+          drawScene(t,sample);drawSpikeProbes(t);drawBrainAtlas(t);drawSpeedTimeline(t);drawEventTimeline(t);drawNeuralTimeline(t);
           scrubber.value=t;byId('clock').textContent=formatTime(t)+' / '+formatTime(D.duration);
           if(performance.now()>toastUntil)toast.classList.remove('show');
         }
@@ -2155,9 +2408,11 @@ def build_behavior_replay_html(payload, behavior_only=False):
     """
     return (
         template.replace("__DATA__", replay_json)
+        .replace("__VIDEO_CONTROLS__", controls if behavior_only or compact else "")
+        .replace("__GLOBAL_CONTROLS__", "" if behavior_only or compact else controls)
         .replace("__MOUSE__", safe_mouse)
         .replace("__DATE__", safe_date)
-        .replace("__MODE_CLASS__", "behavior-only" if behavior_only else "")
+        .replace("__MODE_CLASS__", ("behavior-only" if behavior_only else "") + (" compact" if compact else ""))
     )
 
 
@@ -2268,7 +2523,7 @@ def figure_to_png(figure, plot_name):
     return output.getvalue()
 
 
-@st.cache_data(show_spinner="Building plot...", max_entries=256)
+@st.cache_data(show_spinner=False, max_entries=256)
 def _build_behavior_plot_legacy(path: str, signature, mouse_id: str, plot_name: str, session_key=None):
     plot_style_version = "behavior-panel-v1"
     del plot_style_version
@@ -2380,10 +2635,9 @@ def _failure_distribution_figure(values, max_x=None):
     return _finish_behavior_plot(figure, height=380, showlegend=False)
 
 
-@st.cache_data(show_spinner="Building plot...", max_entries=256)
+@st.cache_data(show_spinner=False, max_entries=256)
 def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, session_key=None):
-    dataframe = load_behavior_database(path, signature)
-    mouse_df = dataframe[dataframe["Mouse_ID"] == mouse_id].copy().sort_values("Date")
+    mouse_df = load_behavior_mouse(path, signature, mouse_id).copy().sort_values("Date")
     mouse_df["SessionIndex"] = np.arange(1, len(mouse_df) + 1)
     dates = mouse_df["Date"].dt.strftime("%Y-%m-%d")
 
@@ -2510,8 +2764,14 @@ def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, ses
 
     if plot_name == "kde_failures_by_session":
         sessions = mouse_df[(mouse_df["Protocol"] == 3) & (mouse_df["Proba_val"] == .30)]
-        valid_sessions = [(row["Date"], _valid_failure_values(row)) for _, row in sessions.iterrows()]
-        valid_sessions = [(date, values) for date, values in valid_sessions if len(values) >= 100]
+        valid_sessions = []
+        for _, row in sessions.iterrows():
+            if count_valid_bouts(row) < MIN_TASK_CORRECT_BOUTS:
+                continue
+            values = _valid_failure_values(row)
+            if len(values) < 2 or len(np.unique(values)) < 2:
+                continue
+            valid_sessions.append((row["Date"], values))
         if not valid_sessions:
             return None
         figure = go.Figure()
@@ -2521,7 +2781,7 @@ def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, ses
             kde = gaussian_kde(values); kde.set_bandwidth(kde.factor * .8)
             figure.add_trace(go.Scatter(x=xs, y=kde(xs), mode="lines", name=pd.Timestamp(date).strftime("%Y-%m-%d"),
                 line={"color": colors[index], "width": 2.5}, showlegend=False,
-                hovertemplate="%{x:.1f} failures<br>%{y:.3f} density<extra></extra>"))
+                hovertemplate="%{x:.1f} consecutive failures<br>%{y:.3f} density<extra></extra>"))
         figure.update_xaxes(title="Consecutive failures", range=[0, 30])
         figure.update_yaxes(title="Density", rangemode="tozero")
         return _finish_behavior_plot(figure, height=380, showlegend=False, margin={"l": 54, "r": 20, "t": 18, "b": 48})
@@ -2530,20 +2790,23 @@ def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, ses
         sessions = mouse_df[(mouse_df["Protocol"] == 3) & (mouse_df["Proba_val"] == .30)]
         records = []
         for _, row in sessions.iterrows():
+            correct_bouts = count_valid_bouts(row)
+            if correct_bouts < MIN_TASK_CORRECT_BOUTS:
+                continue
             failures = np.asarray(compute_failures(row), dtype=float)
             rewards = np.asarray(count_reward_per_bout(row), dtype=float)
             count = min(len(failures), len(rewards)); failures, rewards = failures[:count], rewards[:count]
             keep = valid_bout_mask_from_row(row, target_len=count) & np.isfinite(failures) & np.isfinite(rewards) & (failures > 0) & (failures <= 30) & (rewards <= 7)
-            if keep.sum() < 100 or len(np.unique(rewards[keep])) < 2: continue
+            if keep.sum() < 2 or len(np.unique(rewards[keep])) < 2: continue
             model = LinearRegression().fit(rewards[keep, None], failures[keep])
-            records.append((pd.Timestamp(row["Date"]), keep.sum(), float(model.coef_[0]), float(model.intercept_), float(failures[keep].mean())))
+            records.append((pd.Timestamp(row["Date"]), correct_bouts, float(model.coef_[0]), float(model.intercept_), float(failures[keep].mean())))
         if not records: return None
-        figure = make_subplots(rows=1, cols=3, subplot_titles=("Reward vs failures", "Slope over time", "Mean failures over time"), horizontal_spacing=.09)
+        figure = make_subplots(rows=1, cols=3, horizontal_spacing=.09)
         line_x = np.linspace(1, 7, 80); colors = _behavior_date_colors(len(records))
         for index, (date, count, slope, intercept, mean) in enumerate(records):
             figure.add_trace(go.Scatter(x=line_x, y=slope*line_x+intercept, mode="lines", name=date.strftime("%Y-%m-%d"),
                 line={"color": colors[index], "width": 2.3}, showlegend=False,
-                hovertemplate=date.strftime("%Y-%m-%d") + "<br>%{x:.1f} rewards<br>%{y:.2f} failures<extra></extra>"), row=1, col=1)
+                hovertemplate=date.strftime("%Y-%m-%d") + "<br>%{x:.1f} rewards<br>%{y:.2f} consecutive failures<extra></extra>"), row=1, col=1)
         labels = [record[0].strftime("%m-%d") for record in records]; indexes = np.arange(len(records)); slopes = np.array([r[2] for r in records]); means = np.array([r[4] for r in records])
         for column, values in [(2, slopes), (3, means)]:
             trend = fit_exponential_trend_with_band(values)
@@ -2570,13 +2833,20 @@ def build_behavior_plot(path: str, signature, mouse_id: str, plot_name: str, ses
             ), row=1, col=column)
             figure.update_xaxes(tickmode="array", tickvals=indexes, ticktext=labels, tickangle=-35, row=1, col=column)
         figure.update_xaxes(title="Reward count", range=[1, 7], row=1, col=1); figure.update_yaxes(title="Consecutive failures", row=1, col=1)
-        figure.update_yaxes(title="Linear slope", row=1, col=2); figure.update_yaxes(title="Mean failures", row=1, col=3)
+        figure.update_yaxes(title="Linear slope", row=1, col=2); figure.update_yaxes(title="Mean consecutive failures", row=1, col=3)
         return _finish_behavior_plot(figure, height=410, showlegend=False, margin={"l": 54, "r": 24, "t": 58, "b": 64})
 
     date_iso, version = session_key
     rows = mouse_df[(mouse_df["Date"].dt.strftime("%Y-%m-%d") == date_iso) & (mouse_df["Version"].astype(str) == str(version))]
     if rows.empty: return None
     row = rows.iloc[0]
+    return build_behavior_session_plot(row, plot_name)
+
+
+def build_behavior_session_plot(row, plot_name):
+    """Render session plots from the exact selected behavior row."""
+    if isinstance(row, dict):
+        row = pd.Series(row, dtype=object)
     if plot_name == "session_failure_distribution":
         _, failures, _ = prepare_session_arrays(row, reward_cut=7)
         return _failure_distribution_figure(failures, max_x=25)
@@ -2884,7 +3154,7 @@ def channel_locations_signature(inventory: pd.DataFrame):
     return tuple(watched)
 
 
-@st.cache_data(show_spinner="Loading final IBL channel locations...", max_entries=16)
+@st.cache_data(show_spinner=False, max_entries=16)
 def load_ibl_probe_tracks(track_rows, signature):
     del signature
     tracks = []
@@ -2954,7 +3224,7 @@ def load_ibl_probe_tracks(track_rows, signature):
     return tracks
 
 
-@st.cache_data(show_spinner="Loading probe trajectories...", max_entries=16)
+@st.cache_data(show_spinner=False, max_entries=16)
 def load_probe_tracks(track_rows, signature):
     del signature
     tracks = []
@@ -3085,7 +3355,7 @@ def probe_analysis_signature(locations_path: Path, session_dir=None, probe=None)
     )
 
 
-@st.cache_data(show_spinner="Loading session metrics...", max_entries=32)
+@st.cache_data(show_spinner=False, max_entries=32)
 def load_probe_analysis(
     locations_path: str,
     signature,
@@ -3093,6 +3363,7 @@ def load_probe_analysis(
     session_path=None,
     probe_name=None,
     on_site_arrival_times=(),
+    include_activity=True,
 ):
     del signature
     locations_path = Path(locations_path)
@@ -3201,7 +3472,11 @@ def load_probe_analysis(
                 spike_count = min(len(spike_times), len(spike_clusters))
                 # Bound temporary allocations even for recordings with millions of spikes.
                 computed_spike_counts = np.zeros(len(units), dtype=float)
-                for chunk_start in range(0, spike_count, 1_000_000):
+                needs_spike_counts = (
+                    pd.to_numeric(units["num_spikes"], errors="coerce").isna().any()
+                    or pd.to_numeric(units["firing_rate"], errors="coerce").isna().any()
+                )
+                for chunk_start in range(0, spike_count if needs_spike_counts else 0, 1_000_000):
                     cluster_values = np.asarray(
                         spike_clusters[chunk_start:min(chunk_start + 1_000_000, spike_count)],
                         dtype=int,
@@ -3224,7 +3499,7 @@ def load_probe_analysis(
                 good_unit_table = good_unit_table.dropna(subset=["peak_channel"])
                 good_unit_table = good_unit_table.sort_values("depth_um", na_position="last")
                 good_cluster_ids = good_unit_table["unit_id"].to_numpy(dtype=int)
-                if len(good_cluster_ids) and spike_count:
+                if include_activity and len(good_cluster_ids) and spike_count:
                     channel_count = 384
                     time_edges = np.linspace(behavior_start_s, behavior_stop_s, 301)
                     counts = np.zeros((channel_count, len(time_edges) - 1), dtype=float)
@@ -3518,7 +3793,7 @@ def atlas_mesh_signature(mesh_path: Path):
     return stat.st_mtime_ns, stat.st_size
 
 
-@st.cache_resource(show_spinner="Loading Allen atlas surface...", max_entries=4)
+@st.cache_resource(show_spinner=False, max_entries=4)
 def load_obj_mesh(mesh_path: str, signature):
     del signature
     vertices = []
@@ -3574,7 +3849,7 @@ def build_replay_atlas_geometry(brain_mesh, exact_region_meshes):
     }
 
 
-@st.cache_data(show_spinner="Preparing Allen atlas slices...", max_entries=12)
+@st.cache_data(show_spinner=False, max_entries=12)
 def build_replay_atlas_slices(annotation_path, annotation_signature, structures_path, structures_signature, region_names, default_ap_frame):
     del annotation_signature, structures_signature
     structures = pd.read_csv(structures_path)
@@ -3807,9 +4082,9 @@ def build_probe_figure(
     )
 
     region_styles = {
-        "MOs": {"color": "#B3A06F", "opacity": 0.22},
-        "STR": {"color": "#B3A06F", "opacity": 0.22},
-        "CP": {"color": "#C3A85F", "opacity": 0.27},
+        "MOs": {"color": "#B3A06F", "opacity": 0.07},
+        "STR": {"color": "#B3A06F", "opacity": 0.05},
+        "CP": {"color": "#C3A85F", "opacity": 0.08},
     }
     for region, mesh in (region_meshes or {}).items():
         region_vertices, region_faces = mesh
@@ -3913,7 +4188,7 @@ def build_probe_figure(
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         paper_bgcolor="#111B2A",
         plot_bgcolor="#111B2A",
-        uirevision="allen-probe-scene-profile-v2",
+        uirevision="allen-probe-scene-oblique-v6",
         showlegend=False,
         scene={
             "aspectmode": "data",
@@ -3922,7 +4197,7 @@ def build_probe_figure(
             "yaxis": {"visible": False, "showbackground": False},
             "zaxis": {"visible": False, "showbackground": False, "autorange": "reversed"},
             "camera": {
-                "eye": {"x": 1.20, "y": 0.0, "z": 0.14},
+                "eye": {"x": 1.145, "y": -0.417, "z": 0.792},
                 "up": {"x": 0, "y": 0, "z": 1},
             },
             "dragmode": "turntable",
@@ -4773,7 +5048,7 @@ def build_activity_heatmap(activity_heatmap, bout_start_times=None, height=520):
         cols=1,
         shared_xaxes=True,
         row_heights=[0.89, 0.11],
-        vertical_spacing=0.008,
+        vertical_spacing=0.045,
     )
     figure.add_trace(
         go.Heatmap(
@@ -4810,7 +5085,7 @@ def build_activity_heatmap(activity_heatmap, bout_start_times=None, height=520):
         go.Bar(
             x=bout_times,
             y=np.full(len(bout_times), 0.22),
-            base=0.68,
+            base=0.39,
             width=0.009,
             marker={"color": "#C94A4A", "line": {"width": 0}},
             name="bout start",
@@ -4822,14 +5097,16 @@ def build_activity_heatmap(activity_heatmap, bout_start_times=None, height=520):
         col=1,
     )
     figure.add_annotation(
-        x=0.5,
-        y=0.002,
+        x=0,
+        y=0.50,
         xref="paper",
-        yref="paper",
+        yref="y2",
         text="Bout start",
         showarrow=False,
-        xanchor="center",
-        font={"size": 12, "color": MUTED},
+        xanchor="right",
+        xshift=-8,
+        yanchor="middle",
+        font={"size": 10, "color": MUTED},
     )
     figure.update_xaxes(
         showticklabels=False, showgrid=False, fixedrange=True, row=1, col=1
@@ -5294,12 +5571,10 @@ def set_ephys_session(state_key, session_date):
 def open_mouse_view(mouse_id, view):
     st.session_state["global_mouse"] = mouse_id
     st.session_state[NAVIGATION_STATE_KEY] = view
-    st.session_state["_scroll_to_top_requested"] = True
 
 
 def set_global_view(view):
     st.session_state[NAVIGATION_STATE_KEY] = view
-    st.session_state["_scroll_to_top_requested"] = True
 
 
 def sync_navigation_mouse(widget_key):
@@ -5399,49 +5674,22 @@ def home_global_summary(mouse_count, openfield_count, ephys_count, protocol_coun
     openfield_icon = '<svg viewBox="0 0 48 48" fill="none"><rect x="7" y="7" width="34" height="34" rx="7" stroke="currentColor" stroke-width="3"/><path d="M13 24s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z" stroke="currentColor" stroke-width="3"/><circle cx="24" cy="24" r="4" fill="currentColor"/></svg>'
     ephys_icon = '<svg viewBox="0 0 48 48" fill="none"><path d="M8 25h7l4-12 7 23 5-16 3 5h6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
     return (
-        '<div class="home-summary-band">'
-        f'<div class="home-summary-block"><div class="home-summary-mice"><strong>{int(mouse_count)}</strong><span>Mice</span></div></div>'
-        f'<div class="home-summary-block"><div class="home-summary-pie" style="background:{gradient}"></div><div class="home-summary-legend">{legend}</div></div>'
-        f'<div class="home-summary-block"><div class="home-summary-icon ephys">{ephys_icon}</div><div class="home-summary-value"><strong>{int(ephys_count)}</strong>Ephys</div></div>'
-        f'<div class="home-summary-block"><div class="home-summary-icon openfield">{openfield_icon}</div><div class="home-summary-value"><strong>{int(openfield_count)}</strong>Openfield</div></div>'
+        '<div class="home-summary-band" style="height:78px!important;min-height:78px!important;padding:12px 0;box-sizing:border-box;overflow:hidden;background:rgba(255,255,255,.62);align-items:center;">'
+        f'<div class="home-summary-block" style="height:54px!important;min-height:0!important;box-sizing:border-box;padding:0 12px;"><div class="home-summary-mice"><strong>{int(mouse_count)}</strong><span>Mice</span></div></div>'
+        f'<div class="home-summary-block" style="height:54px!important;min-height:0!important;box-sizing:border-box;padding:0 12px;"><div class="home-summary-pie" style="background:{gradient}"></div><div class="home-summary-legend">{legend}</div></div>'
+        f'<div class="home-summary-block" style="height:54px!important;min-height:0!important;box-sizing:border-box;padding:0 12px;"><div class="home-summary-icon ephys">{ephys_icon}</div><div class="home-summary-value"><strong>{int(ephys_count)}</strong>Ephys</div></div>'
+        f'<div class="home-summary-block" style="height:54px!important;min-height:0!important;box-sizing:border-box;padding:0 12px;"><div class="home-summary-icon openfield">{openfield_icon}</div><div class="home-summary-value"><strong>{int(openfield_count)}</strong>Openfield</div></div>'
         '</div>'
     )
 
 
-def behavior_mouse_summary(mouse_id, mouse_df):
-    protocol_counts = (
-        pd.to_numeric(mouse_df.get("Protocol"), errors="coerce")
-        .dropna().astype(int).value_counts().reindex([1, 2, 3, 4], fill_value=0)
+def render_summary_band(items):
+    blocks = "".join(
+        '<div class="uniform-summary-item">'
+        f'<strong>{html.escape(str(value))}</strong><span>{html.escape(label)}</span></div>'
+        for label, value in items
     )
-    values = [
-        ("Training 1", int(protocol_counts.get(1, 0)), BEHAVIOR_PROTOCOL_COLORS[1]),
-        ("Training 2", int(protocol_counts.get(2, 0)), BEHAVIOR_PROTOCOL_COLORS[2]),
-        ("Task", int(protocol_counts.get(3, 0)), BEHAVIOR_PROTOCOL_COLORS[3]),
-        ("Flexifliping", int(protocol_counts.get(4, 0)), BEHAVIOR_PROTOCOL_COLORS[4]),
-    ]
-    total = sum(value for _, value, _ in values)
-    cursor, parts = 0.0, []
-    for _, value, color in values:
-        if value <= 0 or total <= 0:
-            continue
-        end = cursor + value / total * 100
-        parts.append(f"{color} {cursor:.2f}% {end:.2f}%")
-        cursor = end
-    gradient = "conic-gradient(" + ", ".join(parts) + ")" if parts else "#D7E1EA"
-    legend = "".join(
-        f'<span><i style="background:{color}"></i><b>{value}</b> {label}</span>'
-        for label, value, color in values
-    )
-    latest = mouse_df["Date"].max()
-    latest_label = latest.strftime("%Y-%m-%d") if pd.notna(latest) else "-"
-    return (
-        '<div class="behavior-mouse-band">'
-        f'<div class="behavior-mouse-block"><div class="behavior-mouse-primary"><strong>{html.escape(str(mouse_id))}</strong><span>MOUSE</span></div></div>'
-        f'<div class="behavior-mouse-block"><div class="behavior-mouse-primary"><strong>{len(mouse_df)}</strong><span>SESSIONS</span></div></div>'
-        f'<div class="behavior-mouse-block"><div class="behavior-mouse-pie" style="background:{gradient}"></div><div class="behavior-mouse-legend">{legend}</div></div>'
-        f'<div class="behavior-mouse-block"><div class="behavior-mouse-primary"><strong>{latest_label}</strong><span>LATEST SESSION</span></div></div>'
-        '</div>'
-    )
+    st.markdown(f'<div class="uniform-summary">{blocks}</div>', unsafe_allow_html=True)
 
 
 def sync_ephys_probe(shared_key, widget_key):
@@ -5486,10 +5734,8 @@ def section(title, accent=NAVY):
 @contextmanager
 def section_card(title):
     section_key = "ephys_section_" + re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-    with st.container(border=True, key=section_key):
-        st.markdown(f'<div class="section-card-title">{title}</div>', unsafe_allow_html=True)
+    with st.container(border=False, key=section_key):
         yield
-    st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
 
 
 @contextmanager
@@ -5497,23 +5743,52 @@ def behavior_section_card(title):
     section_key = "behavior_section_" + re.sub(
         r"[^a-z0-9]+", "_", title.lower()
     ).strip("_")
-    with st.container(border=True, key=section_key):
-        st.markdown(f'<div class="section-card-title">{title}</div>', unsafe_allow_html=True)
+    with st.container(border=False, key=section_key):
         yield
-    st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
 
 
-def behavior_plot_card(title, figure):
+def behavior_session_info_values(row):
+    """Identical session summaries for Behavior Sessions and Ephys Replay."""
+    duration = pd.to_numeric(row.get("Session Dur"), errors="coerce")
+    minutes = float(duration) / 60 if pd.notna(duration) else np.nan
+    valid = int(count_valid_bouts(row))
+    total = pd.to_numeric(row.get("Number of Bouts"), errors="coerce")
+    total = int(total) if pd.notna(total) else 0
+    rewarded = pd.to_numeric(row.get("Number of Rewarded Licks"), errors="coerce")
+    rewarded = float(rewarded) if pd.notna(rewarded) else 0.
+    correct = int(np.asarray(row.get("Correct Bouts", []), dtype=bool).sum())
+    protocol = pd.to_numeric(row.get("Protocol"), errors="coerce")
+    return [
+        ("PROTOCOL", PROTOCOL_LABELS.get(int(protocol), "-") if pd.notna(protocol) else "-"),
+        ("PROBABILITIES", row.get("Probas", "-")),
+        ("DURATION", f"{minutes:.1f} min" if np.isfinite(minutes) else "-"),
+        ("VALID BOUTS", f"{valid} / {total}"),
+        ("SUCCESS RATE", f"{100 * correct / valid:.1f}%" if valid else "-"),
+        ("REWARDED LICKS / MIN", f"{rewarded / minutes:.2f}" if minutes > 0 else "-"),
+    ]
+
+
+def behavior_plot_card(title, figure, height=None, compact=False):
     st.markdown(
         f'<div class="subplot-title behavior-subtitle">{title}</div>',
         unsafe_allow_html=True,
     )
-    plot_card(figure)
+    plot_card(figure, height=height, compact=compact)
 
 
-def plot_card(image):
+def plot_card(image, height=None, compact=False):
     with st.container(border=False):
         if isinstance(image, go.Figure):
+            if height is not None:
+                image = go.Figure(image)
+                image.update_layout(height=height)
+                image.update_layout(margin=dict(l=45, r=20, t=22, b=38))
+            if compact:
+                image = go.Figure(image)
+                image.update_layout(font={"size": 9}, margin={"l": 40, "r": 12, "t": 26, "b": 40})
+                image.update_xaxes(title_font={"size": 9}, tickfont={"size": 8}, nticks=4, automargin=True)
+                image.update_yaxes(title_font={"size": 9}, tickfont={"size": 8}, nticks=3, automargin=True)
+                image.update_annotations(font={"size": 9})
             st.plotly_chart(
                 image,
                 width="stretch",
@@ -5982,7 +6257,7 @@ def chatbot_group_behavior(records, group_by, aggregation):
     return grouped
 
 
-@st.cache_data(show_spinner="Reading ephys unit metrics…", max_entries=128)
+@st.cache_data(show_spinner=False, max_entries=128)
 def load_chatbot_ephys_units(mouse, date, probe, locations_path, session_path, signature):
     del signature
     session_dir = Path(session_path)
@@ -6694,7 +6969,7 @@ def run_chatbot_turn(
 
 
 def render_chatbot_view(selected_mouse=None):
-    with st.container(border=True, key="chatbot_shell"):
+    with st.container(border=False, key="chatbot_shell"):
         api_key = chatbot_api_key()
         if OpenAI is None:
             st.error("The OpenAI SDK is not installed. Run: pip install openai")
@@ -6715,16 +6990,6 @@ def render_chatbot_view(selected_mouse=None):
             st.session_state["chatbot_tool_version"] = CHATBOT_TOOL_VERSION
             st.session_state["chatbot_messages"] = []
         analysis_mode = "Advanced"
-        with st.container(key="chatbot_controls"):
-            spacer_col, clear_col, astra_col = st.columns([7.4, 1, 1.8], gap="small")
-            with clear_col:
-                if st.button("Clear", key="chatbot_clear", width="stretch"):
-                    st.session_state["chatbot_messages"] = []
-                    st.rerun()
-            with astra_col:
-                st.toggle(
-                    "GPT-6 Astra", key="chatbot_astra", value=False,
-                )
         with st.container(height=430, border=False, key="chatbot_history"):
             for message_index, message in enumerate(st.session_state["chatbot_messages"]):
                 with st.chat_message(message["role"]):
@@ -6747,7 +7012,7 @@ def render_chatbot_view(selected_mouse=None):
                         )
             if st.session_state.pop("chatbot_pending_response", False):
                 if st.session_state["chatbot_messages"] and st.session_state["chatbot_messages"][-1]["role"] == "user":
-                    with st.spinner("Analyzing local data…"):
+                    with nullcontext():
                         try:
                             answer, figures = run_chatbot_turn(
                                 api_key, st.session_state["chatbot_messages"], selected_mouse,
@@ -6759,7 +7024,16 @@ def render_chatbot_view(selected_mouse=None):
                         "role": "assistant", "content": answer, "figures": figures,
                     })
                     st.rerun()
-        prompt = st.chat_input("Ask about your data…")
+        with st.container(key="chatbot_controls"):
+            input_col, clear_col, astra_col = st.columns([8, 1, 1.8], gap="small", vertical_alignment="center")
+            with input_col:
+                prompt = st.chat_input("Ask about your data...")
+            with clear_col:
+                if st.button("Clear", key="chatbot_clear", width="stretch"):
+                    st.session_state["chatbot_messages"] = []
+                    st.rerun()
+            with astra_col:
+                st.toggle("GPT-6 Astra", key="chatbot_astra", value=False)
         if prompt:
             st.session_state["chatbot_messages"].append({"role": "user", "content": prompt, "figures": []})
             st.session_state["chatbot_pending_response"] = True
@@ -6771,7 +7045,7 @@ def render_home_view():
         render_no_data()
         return
 
-    dataframe = load_behavior_database(
+    dataframe = load_behavior_catalog(
         str(BEHAVIOR_DB), source_signature(BEHAVIOR_DB)
     )
     dataframe = dataframe[dataframe["Mouse_ID"].apply(is_visible_mouse)].copy()
@@ -6838,26 +7112,7 @@ def render_home_view():
         ),
         reverse=True,
     )
-    total_ephys_sessions = int(
-        ephys_inventory[["mouse", "date"]].drop_duplicates().shape[0]
-    ) if not ephys_inventory.empty else 0
-    total_openfield_sessions = int(len(openfield_inventory))
-    global_protocol_counts = (
-        pd.to_numeric(dataframe["Protocol"], errors="coerce")
-        .dropna().astype(int).value_counts().to_dict()
-    )
-    with st.container(border=True, key="home_summary"):
-        st.markdown(
-            home_global_summary(
-                len(mouse_ids), total_openfield_sessions,
-                total_ephys_sessions, global_protocol_counts,
-            ),
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
-    with st.container(border=True, key="home_mouse_grid"):
-        st.markdown('<div class="section-card-title">Mice</div>', unsafe_allow_html=True)
+    with st.container(border=False, key="home_mouse_grid"):
         card_columns = st.columns(4, gap="medium")
         for index, mouse_id in enumerate(mouse_ids):
             mouse_rows = dataframe[dataframe["Mouse_ID"] == mouse_id]
@@ -6903,7 +7158,7 @@ def render_home_view():
                     openfield_column, info_column = st.columns(2, gap="small")
                     with openfield_column:
                         st.button(
-                            f"Openfield **{openfield_count}**", key=f"home_openfield_{safe_mouse}",
+                            f"Arena tests **{openfield_count}**", key=f"home_openfield_{safe_mouse}",
                             on_click=open_mouse_view, args=(mouse_id, "Openfield"),
                             width="stretch", disabled=openfield_count == 0,
                         )
@@ -6915,13 +7170,37 @@ def render_home_view():
                         )
 
 
+def remember_behavior_session(widget_key, saved_key):
+    st.session_state[saved_key] = st.session_state[widget_key]
+    st.session_state["behavior_tabs"] = "Sessions"
+
+
+def warm_behavior_tabs(path, signature, mouse_id, session_key):
+    """Populate the same caches used by the visible tab, without emitting UI."""
+    for plot_name, selection in [
+        ("training_outcomes", None),
+        ("histogram_kde_failures", None),
+        ("kde_failures_by_session", None),
+        ("regression", None),
+        ("session_timeline", session_key),
+        ("session_rewards_failures", session_key),
+        ("session_failure_distribution", session_key),
+    ]:
+        try:
+            build_behavior_plot(path, signature, mouse_id, plot_name, selection)
+        except Exception:
+            # Prefetch is optional. A foreground request will report any failure.
+            continue
+
+
+@st.fragment
 def render_behavior_view(view_mode, mouse_id=None):
     if not BEHAVIOR_DB.exists():
         render_no_data()
         return
 
     signature = source_signature(BEHAVIOR_DB)
-    dataframe = load_behavior_database(str(BEHAVIOR_DB), signature)
+    dataframe = load_behavior_catalog(str(BEHAVIOR_DB), signature)
     if dataframe.empty:
         render_no_data()
         return
@@ -6936,136 +7215,116 @@ def render_behavior_view(view_mode, mouse_id=None):
 
     mouse_df = dataframe[dataframe["Mouse_ID"] == mouse_id].copy()
 
-    with st.container(border=True, key="behavior_summary"):
-        st.markdown(behavior_mouse_summary(mouse_id, mouse_df), unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
-
-    if view_mode == "Overview":
-        with behavior_section_card("Training progression"):
-            st.markdown(
-                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10%;padding:10px 0 0 0;">'
-                '<div class="subplot-title behavior-subtitle">Valid bouts</div>'
-                '<div class="subplot-title behavior-subtitle">Rewarded licks / min</div>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            plot_card(
-                build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, "training_outcomes")
-            )
-
-        with behavior_section_card("Performance structure"):
-            col1, col2 = st.columns(2, gap="large")
-            with col1:
-                behavior_plot_card(
-                    "Failure distribution",
-                    build_behavior_plot(
-                        str(BEHAVIOR_DB), signature, mouse_id, "histogram_kde_failures"
-                    ),
-                )
-            with col2:
-                behavior_plot_card(
-                    "Failures across sessions",
-                    build_behavior_plot(
-                        str(BEHAVIOR_DB), signature, mouse_id, "kde_failures_by_session"
-                    ),
-                )
-            behavior_plot_card(
-                "Rewards and failures",
-                build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, "regression"),
-            )
-
-    mouse_df["label"] = (
-        mouse_df["Date"].dt.strftime("%Y-%m-%d")
-        + " · "
-        + mouse_df["Protocol"].apply(
-            lambda value: PROTOCOL_LABELS.get(int(value), f"Protocol {int(value)}")
-            if pd.notna(value)
-            else "-"
-        )
-        + " · v"
-        + mouse_df["Version"].astype(str)
+    for tab_key in ("behavior_tabs", "_dashboard_tab_selection_behavior_tabs"):
+        if st.session_state.get(tab_key) in {"Training", "Performance", "Progression"}:
+            st.session_state[tab_key] = "Overview"
+    overview_tab, behavior_session_tab = dashboard_tabs(
+        ["Overview", "Sessions"],
+        key="behavior_tabs",
     )
-    session_labels = mouse_df["label"].tolist()
-    session_state_key = f"behavior_session_{mouse_id}"
-    if st.session_state.get(session_state_key) not in session_labels:
-        st.session_state[session_state_key] = session_labels[-1]
-
-    with behavior_section_card("Session focus"):
-        st.markdown('<div class="subplot-title anatomy-subtitle">Session</div>', unsafe_allow_html=True)
-        st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-        selected_label = st.selectbox(
-            "Session", session_labels, key=session_state_key,
-            label_visibility="collapsed",
+    if behavior_session_tab.open:
+        mouse_df = load_behavior_mouse(str(BEHAVIOR_DB), signature, mouse_id).copy()
+    with overview_tab:
+        if overview_tab.open:
+            render_behavior_overview(mouse_id, mouse_df)
+            render_behavior_progression_preview({
+                name: build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, name)
+                for name in ("training_outcomes", "histogram_kde_failures",
+                             "kde_failures_by_session", "regression")
+            })
+    with behavior_session_tab:
+        mouse_df = (
+            mouse_df.assign(_session_version=pd.to_numeric(mouse_df["Version"], errors="coerce"))
+            .sort_values(["Date", "_session_version"], ascending=[False, False],
+                         kind="stable", na_position="last")
+            .drop(columns="_session_version")
         )
-        row = mouse_df[mouse_df["label"] == selected_label].iloc[0]
-        session_key = (row["Date"].strftime("%Y-%m-%d"), str(row["Version"]))
-        duration_value = pd.to_numeric(row.get("Session Dur"), errors="coerce")
-        duration_minutes = float(duration_value) / 60 if pd.notna(duration_value) else np.nan
-        valid = int(count_valid_bouts(row))
-        total_value = pd.to_numeric(row.get("Number of Bouts"), errors="coerce")
-        total = int(total_value) if pd.notna(total_value) else 0
-        rewarded_value = pd.to_numeric(row.get("Number of Rewarded Licks"), errors="coerce")
-        rewarded = float(rewarded_value) if pd.notna(rewarded_value) else 0.0
-        rewarded_per_minute = rewarded / duration_minutes if duration_minutes > 0 else np.nan
-        correct = int(np.asarray(row.get("Correct Bouts", []), dtype=bool).sum())
-        success_rate = 100 * correct / valid if valid else np.nan
-        st.markdown('<div class="subplot-title behavior-subtitle">Stats</div>', unsafe_allow_html=True)
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        with m1:
-            quiet_metric("Protocol", PROTOCOL_LABELS.get(int(row["Protocol"]), "-") if pd.notna(row["Protocol"]) else "-", "#4D9FC7")
-        with m2:
-            quiet_metric("Probabilities", row.get("Probas", "-"), "#80639A")
-        with m3:
-            quiet_metric("Duration", f"{duration_minutes:.1f} min" if np.isfinite(duration_minutes) else "-", "#C48752")
-        with m4:
-            quiet_metric("Valid bouts", f"{valid} / {total}", "#4F9D7D")
-        with m5:
-            quiet_metric("Success rate", f"{success_rate:.1f}%" if np.isfinite(success_rate) else "-", "#4D9FC7")
-        with m6:
-            quiet_metric("Rewarded licks / min", f"{rewarded_per_minute:.2f}" if np.isfinite(rewarded_per_minute) else "-", "#4F9D7D")
-
-        st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
-        replay_row = load_behavior_video_session(
-            str(BEHAVIOR_DB), signature, mouse_id, session_key[0], session_key[1]
+        mouse_df["label"] = (
+            mouse_df["Date"].dt.strftime("%Y-%m-%d")
+            + " · "
+            + mouse_df["Protocol"].apply(
+                lambda value: PROTOCOL_LABELS.get(int(value), f"Protocol {int(value)}")
+                if pd.notna(value)
+                else "-"
+            )
+            + " · v"
+            + mouse_df["Version"].astype(str)
         )
-        replay_payload = (
-            build_behavior_replay_payload(replay_row, mouse_id, session_key[0])
-            if replay_row is not None else None
-        )
-        if replay_payload is None:
-            st.info("Position and speed signals are not available for this session.")
-        else:
-            components.html(
-                build_behavior_replay_html(replay_payload, behavior_only=True),
-                height=455,
-                scrolling=False,
-            )
+        session_labels = mouse_df["label"].tolist()
+        session_state_key = f"behavior_session_v2_{mouse_id}"
+        saved_selection_key = f"_behavior_session_selection_v2_{mouse_id}"
+        jump = st.session_state.pop("behavior_session_jump", None)
+        if jump is not None and jump[0] == str(mouse_id):
+            matches = mouse_df[
+                (mouse_df["Date"].dt.strftime("%Y-%m-%d") == jump[1])
+                & (mouse_df["Version"].astype(str) == jump[2])
+            ]
+            if not matches.empty:
+                st.session_state[session_state_key] = matches.iloc[0]["label"]
+                st.session_state[saved_selection_key] = matches.iloc[0]["label"]
+        saved_label = st.session_state.get(saved_selection_key, st.session_state.get(session_state_key))
+        st.session_state[session_state_key] = saved_label if saved_label in session_labels else None
+        st.session_state[saved_selection_key] = st.session_state[session_state_key]
+        session_key = None
 
-        st.markdown('<div class="subplot-title behavior-subtitle">Behavioral timeline</div>', unsafe_allow_html=True)
-        plot_card(
-            build_behavior_plot(
-                str(BEHAVIOR_DB), signature, mouse_id, "session_timeline", session_key
-            )
-        )
+        if behavior_session_tab.open:
+            st.html("""<style>
+            .st-key-behavior_session_compact .behavior-subtitle {font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:.85rem;margin-bottom:4px;}
+            </style>""")
+            with st.container(key="behavior_session_compact"):
+                    selected_label = st.selectbox(
+                        "Session", session_labels, key=session_state_key, index=None, placeholder="Select a session",
+                        label_visibility="collapsed",
+                        on_change=remember_behavior_session,
+                        args=(session_state_key, saved_selection_key),
+                    )
+                    if selected_label is None:
+                        return
+                    row = mouse_df[mouse_df["label"] == selected_label].iloc[0]
+                    session_key = (row["Date"].strftime("%Y-%m-%d"), str(row["Version"]))
+                    render_behavior_session_info(behavior_session_info_values(row))
 
-        col1, col2 = st.columns(2, gap="large")
-        with col1:
-            behavior_plot_card(
-                "Rewards vs failures",
-                build_behavior_plot(
-                    str(BEHAVIOR_DB), signature, mouse_id,
-                    "session_rewards_failures", session_key,
-                ),
-            )
-        with col2:
-            behavior_plot_card(
-                "Failure distribution",
-                build_behavior_plot(
-                    str(BEHAVIOR_DB), signature, mouse_id,
-                    "session_failure_distribution", session_key,
-                ),
-            )
+                    replay_row = load_behavior_video_session(
+                        str(BEHAVIOR_DB), signature, mouse_id, session_key[0], session_key[1]
+                    )
+                    replay_payload = (
+                        build_behavior_replay_payload(replay_row, mouse_id, session_key[0])
+                        if replay_row is not None else None
+                    )
+                    if replay_payload is None:
+                        st.caption("Position and speed signals are not available for this session.")
+                    else:
+                        components.html(
+                            build_behavior_replay_html(replay_payload, behavior_only=True, compact=True),
+                            height=340, scrolling=False,
+                        )
+                    timeline_area, analysis_area = st.columns(2, gap="medium")
+                    with timeline_area:
+                        behavior_plot_card(
+                            "Behavioral timeline",
+                            build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, "session_timeline", session_key),
+                            height=280, compact=True,
+                        )
+                    with analysis_area:
+                        rewards_area, failures_area = st.columns(2, gap="medium")
+                        with rewards_area:
+                            behavior_plot_card(
+                                "Rewards vs consecutive failures",
+                                build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, "session_rewards_failures", session_key),
+                                height=280, compact=True,
+                            )
+                        with failures_area:
+                            behavior_plot_card(
+                                "Failure distribution",
+                                build_behavior_plot(str(BEHAVIOR_DB), signature, mouse_id, "session_failure_distribution", session_key),
+                                height=280, compact=True,
+                            )
+
+    if session_key is not None:
+        data_prefetcher().submit(
+            (str(BEHAVIOR_DB), repr(signature), str(mouse_id), session_key),
+            lambda: warm_behavior_tabs(str(BEHAVIOR_DB), signature, mouse_id, session_key),
+        )
 
 
 def _render_openfield_view_legacy(mouse=None, inventory=None):
@@ -7222,7 +7481,7 @@ def _render_openfield_view_legacy(mouse=None, inventory=None):
                     key=f"prepare_openfield_video_{mouse}_{selected_date}_{selected_video_label}",
                 ):
                     try:
-                        with st.spinner("Preparing the browser-compatible video…"):
+                        with nullcontext():
                             prepare_browser_video(selected_video)
                         st.rerun()
                     except Exception as error:
@@ -7242,20 +7501,11 @@ def openfield_summary(mouse_id, mouse_inventory):
     counts = (
         mouse_inventory.drop_duplicates(["assay", "date"])["assay"].value_counts()
     )
-    blocks = [("SIT", "#D99A48"), ("OFT", "#4D9FC7"), ("LDT", "#80639A")]
-    assay_html = "".join(
-        '<div class="behavior-mouse-block">'
-        '<div class="behavior-mouse-primary">'
-        f'<strong style="color:{color}">{int(counts.get(assay, 0))}</strong>'
-        f'<span>{assay} SESSIONS</span></div></div>'
-        for assay, color in blocks
-    )
-    return (
-        '<div class="behavior-mouse-band">'
-        '<div class="behavior-mouse-block"><div class="behavior-mouse-primary">'
-        f'<strong>{html.escape(str(mouse_id))}</strong><span>MOUSE</span>'
-        f'</div></div>{assay_html}</div>'
-    )
+    values = [("MOUSE", mouse_id)] + [
+        (f"{assay} SESSIONS", int(counts.get(assay, 0))) for assay in ("OFT", "LDT", "SIT")
+    ]
+    return (_behavior_overview.STYLES + '<div class="behavior-overview-grid">'
+            + _behavior_overview.info_cards_markup(values) + '</div>')
 
 
 def openfield_metric_columns(frame, assay):
@@ -7355,6 +7605,155 @@ def build_openfield_behavior_prediction_plot(csv_path):
     )
     figure.update_yaxes(title=None, showgrid=False)
     return figure
+
+
+OPENFIELD_SKELETON_CORE_POINTS = ("nose", "neck", "torso", "tail_base")
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def load_openfield_skeleton_overlay(tracking_csv, file_size, modified_ns, fps):
+    """Load a lightweight keypoint timeline in the clean video's coordinates."""
+    tracking = pd.read_csv(tracking_csv, header=[0, 1, 2])
+    if tracking.empty:
+        return None
+    scorer_names = {
+        str(column[0]) for column in tracking.columns[1:]
+        if len(column) >= 3
+    }
+    scorer = next(iter(scorer_names), None)
+    if scorer is None:
+        return None
+    effective_fps = max(float(fps or 25.0), 1.0)
+    # Twenty samples per second are enough for smooth interpolation in the
+    # browser and keep the payload small for long recordings.
+    step = max(1, int(round(effective_fps / 20.0)))
+    sample_indices = np.arange(0, len(tracking), step, dtype=int)
+    frame_column = tracking.columns[0]
+    frame_numbers = pd.to_numeric(tracking[frame_column], errors="coerce")
+    sampled_frames = frame_numbers.iloc[sample_indices].to_numpy(dtype=float)
+    fallback_frames = sample_indices.astype(float)
+    sampled_frames = np.where(np.isfinite(sampled_frames), sampled_frames, fallback_frames)
+
+    points = {}
+    bodyparts = sorted({str(column[1]).lower() for column in tracking.columns[1:]})
+    for bodypart in bodyparts:
+        lookup = {
+            str(column[2]).lower(): column
+            for column in tracking.columns
+            if str(column[0]) == scorer and str(column[1]).lower() == bodypart
+        }
+        if "x" not in lookup or "y" not in lookup:
+            continue
+        x_values = pd.to_numeric(tracking[lookup["x"]], errors="coerce").to_numpy(dtype=float)
+        y_values = pd.to_numeric(tracking[lookup["y"]], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        if "likelihood" in lookup:
+            likelihood = pd.to_numeric(
+                tracking[lookup["likelihood"]], errors="coerce"
+            ).to_numpy(dtype=float)
+            valid &= likelihood >= .35
+        sampled = []
+        for index in sample_indices:
+            sampled.append(
+                [round(float(x_values[index]), 2), round(float(y_values[index]), 2)]
+                if valid[index] else None
+            )
+        points[bodypart] = sampled
+    if not points:
+        return None
+    return {
+        "fps": effective_fps,
+        "frames": sampled_frames.astype(int).tolist(),
+        "points": points,
+        "corePoints": list(OPENFIELD_SKELETON_CORE_POINTS),
+    }
+
+
+def build_openfield_video_overlay_html(payload, overlay_id):
+    """Attach a transparent skeleton canvas to the Streamlit video above it."""
+    data_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    overlay_token = json.dumps(str(overlay_id))
+    return f"""
+    <!doctype html><html><head><meta charset="utf-8"><style>
+      html,body{{margin:0;width:1px;height:1px;overflow:hidden;background:transparent}}
+    </style></head><body><script>
+      const D={data_json}, TOKEN={overlay_token};
+      const parentDoc=window.parent.document;
+      const oldBuffer=window.parent.__arenaVideoBuffer;
+      if(oldBuffer){{
+        if(oldBuffer.xhr&&oldBuffer.loading)oldBuffer.xhr.abort();
+        if(oldBuffer.objectUrl)URL.revokeObjectURL(oldBuffer.objectUrl);
+        window.parent.__arenaVideoBuffer=null;
+      }}
+      let canvas=null,ctx=null,video=null,lastDraw='',lastSize='';
+      const finite=p=>p&&Number.isFinite(p[0])&&Number.isFinite(p[1]);
+      function cleanup(){{if(canvas)canvas.remove();canvas=null;ctx=null}}
+      function findVideo(){{
+        const videos=[...parentDoc.querySelectorAll('video')].filter(v=>v.isConnected);
+        video=videos.length?videos[videos.length-1]:null;
+        if(video)video.preload='auto';
+        return video;
+      }}
+      function ensureCanvas(){{
+        if(!video&&!findVideo())return false;
+        if(canvas&&canvas.isConnected)return true;
+        parentDoc.querySelectorAll('canvas[data-arena-skeleton]').forEach(node=>node.remove());
+        parentDoc.querySelectorAll('div[data-arena-video-loader]').forEach(node=>node.remove());
+        canvas=parentDoc.createElement('canvas');canvas.dataset.arenaSkeleton=TOKEN;
+        Object.assign(canvas.style,{{position:'fixed',pointerEvents:'none',zIndex:'1000',display:'none'}});
+        parentDoc.body.appendChild(canvas);ctx=canvas.getContext('2d');return true;
+      }}
+      function schedule(){{
+        if(video&&!video.paused&&typeof video.requestVideoFrameCallback==='function')
+          video.requestVideoFrameCallback(()=>draw());
+        else requestAnimationFrame(draw);
+      }}
+      function sample(name,index,q){{
+        const series=D.points[name],a=series?.[index];if(!finite(a))return null;
+        const b=series?.[Math.min(index+1,series.length-1)];
+        if(!finite(b))return a;return[a[0]+(b[0]-a[0])*q,a[1]+(b[1]-a[1])*q];
+      }}
+      function sampleIndex(t){{
+        const frame=t*D.fps,frames=D.frames;let lo=0,hi=frames.length-1;
+        while(lo<hi){{const mid=Math.ceil((lo+hi)/2);if(frames[mid]<=frame)lo=mid;else hi=mid-1}}
+        const next=Math.min(lo+1,frames.length-1),span=Math.max(1,frames[next]-frames[lo]);
+        return[lo,Math.max(0,Math.min(1,(frame-frames[lo])/span))];
+      }}
+      function resize(rect){{
+        const key=[rect.width,rect.height,window.parent.devicePixelRatio].join(':');
+        canvas.style.left=rect.left+'px';canvas.style.top=rect.top+'px';
+        canvas.style.width=rect.width+'px';canvas.style.height=rect.height+'px';
+        if(key===lastSize)return false;lastSize=key;
+        const d=Math.min(window.parent.devicePixelRatio||1,2);
+        canvas.width=Math.max(1,Math.round(rect.width*d));canvas.height=Math.max(1,Math.round(rect.height*d));
+        ctx.setTransform(d,0,0,d,0,0);return true;
+      }}
+      function draw(){{
+        if(!ensureCanvas()){{schedule();return}}
+        if(!video.isConnected){{cleanup();video=null;schedule();return}}
+        const frame=window.frameElement,visible=frame&&frame.offsetParent!==null;
+        const rect=video.getBoundingClientRect();
+        if(!visible||rect.width<2||rect.height<2){{canvas.style.display='none';schedule();return}}
+        canvas.style.display='block';const resized=resize(rect);
+        const t=video.currentTime||0,drawKey=[t,video.videoWidth,video.videoHeight].join(':');
+        if(drawKey===lastDraw&&!resized){{schedule();return}}lastDraw=drawKey;
+        ctx.clearRect(0,0,rect.width,rect.height);
+        const vw=video.videoWidth||1000,vh=video.videoHeight||1000;
+        const scale=Math.min(rect.width/vw,rect.height/vh),ox=(rect.width-vw*scale)/2,oy=(rect.height-vh*scale)/2;
+        const [index,q]=sampleIndex(t),mapped={{}};
+        Object.keys(D.points).forEach(name=>{{const p=sample(name,index,q);if(p)mapped[name]=[ox+p[0]*scale,oy+p[1]*scale]}});
+        const core=new Set(D.corePoints);
+        Object.entries(mapped).forEach(([name,p])=>{{
+          const isCore=core.has(name);
+          ctx.fillStyle=isCore?'rgba(255,220,38,.98)':'rgba(38,151,255,.96)';
+          ctx.beginPath();ctx.arc(p[0],p[1],isCore?Math.max(4,7.2*scale):Math.max(2.5,4.5*scale),0,Math.PI*2);ctx.fill();
+        }});
+        schedule();
+      }}
+      window.addEventListener('pagehide',cleanup);window.addEventListener('beforeunload',cleanup);
+      requestAnimationFrame(draw);
+    </script></body></html>
+    """
 
 
 @st.cache_data(show_spinner=False)
@@ -7899,9 +8298,9 @@ def prepare_browser_video(video_path, predictions_csv=None, fps=None):
     return output
 
 
-def openfield_session_metrics(mouse, assay, selected_date):
+def openfield_session_metrics(mouse, assay, selected_date, session_frames=None):
     config = OPENFIELD_ASSAY_CONFIG[assay]
-    frame = behavior_metrics_table(config["table"])
+    frame = session_frames[assay] if session_frames is not None else behavior_metrics_table(config["table"])
     if frame.empty or "mouse" not in frame or config["date"] not in frame:
         return frame, None
     selected = frame[
@@ -7911,6 +8310,7 @@ def openfield_session_metrics(mouse, assay, selected_date):
     return frame, selected.iloc[-1] if not selected.empty else None
 
 
+@st.fragment
 def render_openfield_view(mouse=None, inventory=None):
     if inventory is None:
         inventory = discover_openfield_sessions(OPENFIELD_ROOT)
@@ -7929,147 +8329,132 @@ def render_openfield_view(mouse=None, inventory=None):
         .copy().sort_values(["date", "assay"])
     )
 
-    with st.container(border=True, key="behavior_summary"):
-        st.markdown(openfield_summary(mouse, mouse_inventory), unsafe_allow_html=True)
+    with st.spinner("Checking arena session metrics..."):
+        arena_frames, metric_errors = _arena_metrics.collect_metrics(
+            mouse_inventory,
+            {assay: behavior_metrics_table(config["table"]) for assay, config in OPENFIELD_ASSAY_CONFIG.items()},
+        )
+    for metric_error in metric_errors:
+        st.warning(f"Session metrics could not be updated: {metric_error}")
 
-    st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
-    with behavior_section_card("Global metrics"):
-        metric_tabs = st.tabs(["OFT", "LDT", "SIT"])
-        for metric_tab, assay in zip(metric_tabs, ("OFT", "LDT", "SIT")):
-            with metric_tab:
-                config = OPENFIELD_ASSAY_CONFIG[assay]
-                frame = behavior_metrics_table(config["table"])
-                mouse_frame = (
-                    frame[frame["mouse"].astype(str) == str(mouse)].copy()
-                    if not frame.empty and "mouse" in frame else pd.DataFrame()
-                )
-                metric_columns = openfield_metric_columns(mouse_frame, assay)
-                if mouse_frame.empty or not metric_columns:
-                    if assay == "SIT":
-                        st.info(
-                            "SIT videos are indexed, but no SIT metrics table is present "
-                            "in behavior_metrics.sqlite yet."
-                        )
-                    else:
-                        st.info(f"No {assay} metrics are available for {mouse}.")
-                else:
+    for state_key in ("arena_tabs", "_dashboard_tab_selection_arena_tabs"):
+        if st.session_state.get(state_key) == "Global metrics":
+            st.session_state[state_key] = "Overview"
+    overview_tab, openfield_session_tab = dashboard_tabs(
+        ["Overview", "Sessions"], key="arena_tabs",
+    )
+    with overview_tab:
+        if overview_tab.open:
+            with st.container(key="arena_overview_compact"):
+                st.html("""<style>
+                .st-key-arena_overview_compact [data-testid="stVerticalBlock"] {gap:10px;}
+                .st-key-arena_overview_compact .behavior-overview-grid {margin:4px 0 8px;gap:10px;}
+                .st-key-arena_overview_compact .behavior-overview-card {padding:10px 16px;}
+                .st-key-arena_overview_compact .subplot-title {margin:3px 0 0;}
+                .st-key-arena_overview_compact .openfield-metric-grid {
+                    grid-template-columns:repeat(8,minmax(0,1fr));gap:6px;padding:2px 0 5px;
+                }
+                .st-key-arena_overview_compact .openfield-metric-card {
+                    min-height:46px;padding:5px 7px;gap:3px;border-radius:8px;
+                }
+                .st-key-arena_overview_compact .openfield-metric-label {font-size:.66rem;line-height:1.15;}
+                .st-key-arena_overview_compact .openfield-metric-value {font-size:.88rem;}
+                @media(max-width:1100px) {
+                    .st-key-arena_overview_compact .openfield-metric-grid {grid-template-columns:repeat(6,minmax(0,1fr));}
+                }
+                @media(max-width:800px) {
+                    .st-key-arena_overview_compact .openfield-metric-grid {grid-template-columns:repeat(3,minmax(0,1fr));}
+                }
+                </style>""")
+                st.markdown(openfield_summary(mouse, mouse_inventory), unsafe_allow_html=True)
+                for assay in ("OFT", "LDT", "SIT"):
+                    config = OPENFIELD_ASSAY_CONFIG[assay]
+                    frame = arena_frames[assay]
+                    mouse_frame = (
+                        frame[frame["mouse"].astype(str) == str(mouse)].copy()
+                        if not frame.empty and "mouse" in frame else pd.DataFrame()
+                    )
+                    metric_columns = openfield_metric_columns(mouse_frame, assay)
+                    if mouse_frame.empty or not metric_columns:
+                        continue
+                    if not mouse_frame[metric_columns].apply(pd.to_numeric, errors="coerce").notna().any().any():
+                        continue
+                    st.markdown(f'<div class="subplot-title">{assay}</div>', unsafe_allow_html=True)
                     mean_values = mouse_frame[metric_columns].apply(
                         pd.to_numeric, errors="coerce"
                     ).mean()
                     render_openfield_metric_grid(mean_values, metric_columns, assay)
 
-    with behavior_section_card("Session focus"):
-        mouse_inventory["label"] = (
-            mouse_inventory["assay"] + "  |  " + mouse_inventory["date"]
-        )
-        session_labels = mouse_inventory["label"].tolist()
-        session_key = f"openfield_session_{mouse}"
-        if st.session_state.get(session_key) not in session_labels:
-            st.session_state[session_key] = session_labels[-1]
-        selected_label = st.selectbox(
-            "Session", session_labels, key=session_key,
-            label_visibility="collapsed",
-        )
-        selected_row = mouse_inventory[
-            mouse_inventory["label"] == selected_label
-        ].iloc[-1]
-        selected_assay = str(selected_row["assay"])
-        selected_date = str(selected_row["date"])
-        metric_frame, metric_row = openfield_session_metrics(
-            mouse, selected_assay, selected_date
-        )
-
-        st.markdown(
-            '<div class="subplot-title behavior-subtitle">Infos</div>',
-            unsafe_allow_html=True,
-        )
-        stat_columns = st.columns(5, gap="medium")
-        duration = pd.to_numeric(
-            metric_row.get("duration_min") if metric_row is not None else np.nan,
-            errors="coerce",
-        )
-        fps = pd.to_numeric(
-            metric_row.get("fps") if metric_row is not None else np.nan,
-            errors="coerce",
-        )
-        stat_specs = [
-            ("Test", selected_assay, OPENFIELD_ASSAY_CONFIG[selected_assay]["color"]),
-            ("Date", selected_date, "#4D9FC7"),
-            ("Duration", f"{duration:.1f} min" if pd.notna(duration) else "–", "#80639A"),
-            ("Frame rate", f"{fps:.1f} fps" if pd.notna(fps) else "–", "#4F9D7D"),
-            (
-                "Phases" if selected_assay == "SIT" else "Videos",
-                str(len(selected_row["videos"])), "#D99A48",
-            ),
-        ]
-        for column_area, (label, value, color) in zip(stat_columns, stat_specs):
-            with column_area:
-                quiet_metric(label, value, color)
-
-        session_metric_columns = openfield_metric_columns(metric_frame, selected_assay)
-        if metric_row is not None and session_metric_columns:
-            st.markdown(
-                '<div class="subplot-title behavior-subtitle">Session metrics</div>',
-                unsafe_allow_html=True,
+    with openfield_session_tab:
+        if openfield_session_tab.open:
+            mouse_inventory["label"] = (
+                mouse_inventory["assay"] + "  |  " + mouse_inventory["date"]
             )
-            render_openfield_metric_grid(
-                metric_row, session_metric_columns, selected_assay
+            session_labels = mouse_inventory["label"].tolist()
+            session_key = f"openfield_session_v2_{mouse}"
+            if st.session_state.get(session_key) not in session_labels:
+                st.session_state[session_key] = None
+            selected_label = st.selectbox(
+                "Session", session_labels, key=session_key, index=None, placeholder="Select a session",
+                label_visibility="collapsed",
+            )
+            if selected_label is None:
+                return
+            selected_row = mouse_inventory[
+                mouse_inventory["label"] == selected_label
+            ].iloc[-1]
+            selected_assay = str(selected_row["assay"])
+            selected_date = str(selected_row["date"])
+            metric_frame, metric_row = openfield_session_metrics(
+                mouse, selected_assay, selected_date, arena_frames
             )
 
-        videos = list(selected_row["videos"])
-        browser_video = next(
-            (
-                Path(path) for path in videos
-                if Path(path).stem.lower().endswith("_clean_skeleton_h264")
-            ),
-            None,
-        )
-        prediction_csv = next(
-            (
-                path for path in selected_row["csv_files"]
-                if "behavior" in Path(path).stem.lower()
-            ),
-            None,
-        )
-        if browser_video is not None and browser_video.exists():
-            st.markdown(
-                '<div class="subplot-title behavior-subtitle">Video</div>',
-                unsafe_allow_html=True,
+            duration = pd.to_numeric(
+                metric_row.get("duration_min") if metric_row is not None else np.nan,
+                errors="coerce",
             )
-            video_column, behavior_column = st.columns([1, 1], gap="large")
-            with video_column:
-                st.video(str(browser_video), format="video/mp4")
-            with behavior_column:
-                if prediction_csv:
-                    prediction_path = Path(prediction_csv)
-                    prediction_stats = prediction_path.stat()
-                    sidecar_payload = load_openfield_behavior_sidecar(
-                        str(prediction_path), prediction_stats.st_size,
-                        prediction_stats.st_mtime_ns,
-                        float(fps) if pd.notna(fps) else 50.0,
-                    )
-                    if sidecar_payload:
-                        components.html(
-                            build_openfield_behavior_sidecar_html(sidecar_payload),
-                            height=530, scrolling=False,
-                        )
-        if False and videos:
-            clean_skeleton = next(
+            fps = pd.to_numeric(
+                metric_row.get("fps") if metric_row is not None else np.nan,
+                errors="coerce",
+            )
+            stat_specs = [
+                ("Test", selected_assay, OPENFIELD_ASSAY_CONFIG[selected_assay]["color"]),
+                ("Date", selected_date, "#4D9FC7"),
+                ("Duration", f"{duration:.1f} min" if pd.notna(duration) else "–", "#80639A"),
+                ("Frame rate", f"{fps:.1f} fps" if pd.notna(fps) else "–", "#4F9D7D"),
+                (
+                    "Phases" if selected_assay == "SIT" else "Videos",
+                    str(len(selected_row["videos"])), "#D99A48",
+                ),
+            ]
+            render_behavior_session_info([(label, value) for label, value, _ in stat_specs])
+
+            session_metric_columns = openfield_metric_columns(metric_frame, selected_assay)
+            if metric_row is not None and session_metric_columns:
+                st.markdown(
+                    '<div class="subplot-title behavior-subtitle">Session metrics</div>',
+                    unsafe_allow_html=True,
+                )
+                render_openfield_metric_grid(
+                    metric_row, session_metric_columns, selected_assay
+                )
+
+            videos = list(selected_row["videos"])
+            clean_video = next(
                 (
                     Path(path) for path in videos
-                    if "clean" in Path(path).stem.lower()
-                    and "skeleton" in Path(path).stem.lower()
+                    if Path(path).stem.lower().endswith("_clean")
                 ),
                 None,
             )
-            # SIT files are still raw: keep Alone + Visitor as one session and
-            # display Visitor by default until a clean-skeleton export exists.
-            if clean_skeleton is None and selected_assay == "SIT":
-                clean_skeleton = next(
-                    (Path(path) for path in videos if "visitor" in Path(path).stem.lower()),
-                    Path(videos[0]),
-                )
-            selected_video = clean_skeleton
+            tracking_csv = next(
+                (
+                    Path(path) for path in selected_row["csv_files"]
+                    if Path(path).stem.lower().startswith("remapped_cropped_")
+                    and Path(path).stem.lower().endswith("_clean")
+                ),
+                None,
+            )
             prediction_csv = next(
                 (
                     path for path in selected_row["csv_files"]
@@ -8077,42 +8462,270 @@ def render_openfield_view(mouse=None, inventory=None):
                 ),
                 None,
             )
-            playback_video = (
-                cached_browser_video(selected_video, prediction_csv)
-                if selected_video else None
-            )
-            if selected_video is not None and (
-                playback_video is None or not playback_video.exists()
-            ):
-                try:
-                    with st.spinner("Preparing the session video..."):
-                        playback_video = prepare_browser_video(
-                            selected_video, prediction_csv,
-                            float(fps) if pd.notna(fps) else 25.0,
-                        )
-                except Exception as error:
-                    playback_video = None
-                    st.error(f"Video preparation failed: {error}")
-            if playback_video is not None and playback_video.exists():
-                left_space, video_column, right_space = st.columns([1, 3, 1])
-                with video_column:
-                    st.video(str(playback_video), format="video/mp4")
-            else:
-                st.caption(
-                    "No clean-skeleton video is available for this session."
+            clean_is_compatible = False
+            if clean_video is not None and clean_video.exists():
+                clean_stats = clean_video.stat()
+                clean_is_compatible = is_browser_compatible_video(
+                    str(clean_video), clean_stats.st_size, clean_stats.st_mtime_ns
                 )
-                if False and st.button(
-                    "Prepare and play video", type="primary",
-                    key=f"prepare_openfield_video_{mouse}_{selected_date}_{selected_video_label}",
+            if clean_is_compatible:
+                st.markdown(
+                    '<div class="subplot-title behavior-subtitle">Video</div>',
+                    unsafe_allow_html=True,
+                )
+                video_column, behavior_column = st.columns([1, 1], gap="large")
+                with video_column:
+                    st.video(str(clean_video), format="video/mp4")
+                    if tracking_csv is not None and tracking_csv.exists():
+                        tracking_stats = tracking_csv.stat()
+                        skeleton_payload = load_openfield_skeleton_overlay(
+                            str(tracking_csv), tracking_stats.st_size,
+                            tracking_stats.st_mtime_ns,
+                            float(fps) if pd.notna(fps) else 50.0,
+                        )
+                        if skeleton_payload:
+                            components.html(
+                                build_openfield_video_overlay_html(
+                                    skeleton_payload,
+                                    f"{mouse}-{selected_assay}-{selected_date}",
+                                ),
+                                height=1, scrolling=False,
+                            )
+                with behavior_column:
+                    if prediction_csv:
+                        prediction_path = Path(prediction_csv)
+                        prediction_stats = prediction_path.stat()
+                        sidecar_payload = load_openfield_behavior_sidecar(
+                            str(prediction_path), prediction_stats.st_size,
+                            prediction_stats.st_mtime_ns,
+                            float(fps) if pd.notna(fps) else 50.0,
+                        )
+                        if sidecar_payload:
+                            components.html(
+                                build_openfield_behavior_sidecar_html(sidecar_payload),
+                                height=530, scrolling=False,
+                            )
+            elif clean_video is not None:
+                st.caption("This clean video codec is not supported by the browser.")
+            if False and videos:
+                clean_skeleton = next(
+                    (
+                        Path(path) for path in videos
+                        if "clean" in Path(path).stem.lower()
+                        and "skeleton" in Path(path).stem.lower()
+                    ),
+                    None,
+                )
+                # SIT files are still raw: keep Alone + Visitor as one session and
+                # display Visitor by default until a clean-skeleton export exists.
+                if clean_skeleton is None and selected_assay == "SIT":
+                    clean_skeleton = next(
+                        (Path(path) for path in videos if "visitor" in Path(path).stem.lower()),
+                        Path(videos[0]),
+                    )
+                selected_video = clean_skeleton
+                prediction_csv = next(
+                    (
+                        path for path in selected_row["csv_files"]
+                        if "behavior" in Path(path).stem.lower()
+                    ),
+                    None,
+                )
+                playback_video = (
+                    cached_browser_video(selected_video, prediction_csv)
+                    if selected_video else None
+                )
+                if selected_video is not None and (
+                    playback_video is None or not playback_video.exists()
                 ):
                     try:
-                        with st.spinner("Preparing the browser-compatible video…"):
-                            prepare_browser_video(selected_video)
-                        st.rerun()
+                        with nullcontext():
+                            playback_video = prepare_browser_video(
+                                selected_video, prediction_csv,
+                                float(fps) if pd.notna(fps) else 25.0,
+                            )
                     except Exception as error:
-                        st.error(f"Video conversion failed: {error}")
+                        playback_video = None
+                        st.error(f"Video preparation failed: {error}")
+                if playback_video is not None and playback_video.exists():
+                    left_space, video_column, right_space = st.columns([1, 3, 1])
+                    with video_column:
+                        st.video(str(playback_video), format="video/mp4")
+                else:
+                    st.caption(
+                        "No clean-skeleton video is available for this session."
+                    )
+                    if False and st.button(
+                        "Prepare and play video", type="primary",
+                        key=f"prepare_openfield_video_{mouse}_{selected_date}_{selected_video_label}",
+                    ):
+                        try:
+                            with nullcontext():
+                                prepare_browser_video(selected_video)
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"Video conversion failed: {error}")
 
 
+@st.cache_data(show_spinner="Preparing histology…", max_entries=2)
+def build_histology_stack(paths, signatures):
+    """Generate native-space previews with the same orientation as the original slices."""
+    folder = Path(next(path for path in paths if path)).parent
+    fingerprint = hashlib.sha256(json.dumps([6, paths, signatures], default=str).encode()).hexdigest()
+    cache_dir = Path(__file__).parent / ".tools" / "histology_preview_cache"
+    cache_path = cache_dir / f"{fingerprint}.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    available = tuple(path is not None for path in paths)
+    shape, available = native_histology_info(folder)
+    count = shape[0]
+    volumes = [[], []]
+    for index in range(count):
+        frames = native_preview_channels(folder, index, available, count)
+        for channel, frame in enumerate(frames):
+            if frame is not None:
+                volumes[channel].append(frame)
+    volumes = [np.stack(frames) if frames else None for frames in volumes]
+    reference = next(volume for volume in volumes if volume is not None)
+    _, height, width = reference.shape
+    columns = 24
+    sheet = np.zeros(((count + columns - 1) // columns * height, columns * width, 3), dtype=np.uint8)
+    scales = []
+    for channel, volume in enumerate(volumes):
+        if volume is None:
+            scales.append([0., 255.])
+            continue
+        low, high = np.percentile(volume[::8], (1, 99.95))
+        if channel == 1:
+            # Preserve headroom for bright probe pixels in the original slices.
+            samples = [native_histology_slice(folder, int(i), channel, 192, 192)
+                       for i in np.linspace(0, count - 1, min(count, 16))]
+            high = max(float(high) * 2, float(np.percentile(samples, 99.99)))
+        scales.append([float(low), float(high)])
+        normalized = (np.clip((volume - low) / max(float(high - low), 1), 0, 1) * 255).astype(np.uint8)
+        for index, frame in enumerate(normalized):
+            y, x = (index // columns) * height, (index % columns) * width
+            sheet[y:y+height, x:x+width, channel] = frame
+    # One projection and one crop for the entire volume: sliding never pans or zooms.
+    volume_projection = np.mean(reference, axis=0, dtype=np.float64)
+    fixed_bounds = brain_crop_bounds(volume_projection)
+    bounds = [fixed_bounds] * count
+    buffer = BytesIO()
+    Image.fromarray(sheet).save(buffer, format="PNG")
+    payload = dict(image=base64.b64encode(buffer.getvalue()).decode(), count=count,
+                   width=width, height=height, columns=columns, bounds=bounds, scales=scales,
+                   available=list(available))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(cache_path)
+    return payload
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def load_histology_detail(folder, signature, index, available, scales):
+    packed = np.zeros((1140, 1140, 3), dtype=np.uint8)
+    for channel, exists in enumerate(available):
+        if exists:
+            frame = native_histology_slice(folder, index, channel)
+            low, high = scales[channel]
+            packed[:, :, channel] = (np.clip((frame - low) / max(high - low, 1), 0, 1) * 255).astype(np.uint8)
+    buffer = BytesIO()
+    Image.fromarray(packed).save(buffer, format="PNG")
+    return dict(image=base64.b64encode(buffer.getvalue()).decode(), width=1140,
+                height=1140, index=index, available=list(available))
+
+
+_histology_component = components.declare_component(
+    "histology_native_v12",
+    path=str(Path(__file__).parent / "assets" / "components" / "histology"),
+)
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def compact_histology_preview(payload):
+    """Reduce only the slider atlas; detailed slices keep their original resolution."""
+    with Image.open(BytesIO(base64.b64decode(payload["image"]))) as source:
+        factor = 2
+        width, height = payload["width"] // factor, payload["height"] // factor
+        columns = payload["columns"]
+        rows = (payload["count"] + columns - 1) // columns
+        compact = source.resize((columns * width, rows * height), Image.Resampling.BILINEAR)
+        buffer = BytesIO()
+        compact.save(buffer, format="PNG")
+    return {**payload, "image": base64.b64encode(buffer.getvalue()).decode(),
+            "width": width, "height": height}
+
+
+def render_histology_view(mouse):
+    folder = casefold_path(EPHYS_ROOT / str(mouse), "brainreg")
+    paths = [folder / f"downsampled_brain_C{i}.tiff" for i in range(2)]
+    paths = [str(path) if path.exists() else None for path in paths]
+    if not any(paths):
+        st.info("No Brainreg histology images are available for this mouse.")
+        return
+    try:
+        preview_sources = [folder / "brainreg.json"]
+        preview_sources += [folder.parent / "fiji" / f"brain_C{i}.tif" for i in range(2) if (folder.parent / "fiji" / f"brain_C{i}.tif").exists()]
+        preview_sources += [Path(path) for path in paths if path]
+        signatures = tuple(source_signature(path) for path in preview_sources)
+        preview = compact_histology_preview(build_histology_stack(tuple(paths), signatures))
+        key = f"histology_native_v12_{mouse}"
+        selection = st.session_state.get(key) or {}
+        index = selection.get("index", preview["count"] // 2) if isinstance(selection, dict) else preview["count"] // 2
+        index = max(0, min(preview["count"] - 1, int(index)))
+        originals = [casefold_path(folder.parent, "fiji", f"brain_C{i}.tif") for i in range(2)]
+        available = tuple(bool(preview["available"][i] and originals[i].exists()) for i in range(2))
+        fields = [folder / f"deformation_field_{i}.tiff" for i in range(3)]
+        detail = None
+        error = None
+        if any(available):
+            sources = [folder / "brainreg.json"]
+            sources += [path for path, exists in zip(originals, available) if exists]
+            signature = tuple(source_signature(path) for path in sources)
+            try:
+                detail = load_histology_detail(str(folder), signature, index, available,
+                                               tuple(tuple(scale) for scale in preview["scales"]))
+            except (OSError, ValueError, IndexError):
+                error = "Detail unavailable for this slice; showing preview."
+        need_preview = not isinstance(selection, dict) or selection.get("need_preview", True)
+        _histology_component(preview=preview if need_preview else None, detail=detail,
+                             index=index, count=preview["count"], error=error,
+                             default={"index": index, "need_preview": True}, key=key)
+    except (OSError, ValueError) as error:
+        st.error(f"Unable to read the histology volume: {error}")
+
+
+_probe_selection_component = components.declare_component(
+    "persistent_probe_selection_v4",
+    path=str(Path(__file__).parent / "assets" / "components" / "probe-selection"),
+)
+
+
+@st.fragment
+def render_probe_selection_scene(mouse, figure, sessions, state_key):
+    """Confine component events to this scene instead of rerunning the ephys page."""
+    with st.container(key="probe_scene_live"):
+        st.html("""<style>
+        .st-key-probe_scene_live [data-stale="true"],
+        [data-stale="true"]:has(.st-key-probe_scene_live) {
+            opacity:1 !important;
+        }
+        </style>""")
+        selection = _probe_selection_component(
+            figure=figure, sessions=sessions, selected=st.session_state[state_key],
+            storage_key=f"probe-scene-{mouse}", key=f"persistent_probe_selection_v4_{mouse}",
+            default=None,
+        )
+    dates = {item["date"] for item in sessions}
+    if isinstance(selection, dict) and selection.get("date") in dates:
+        st.session_state[state_key] = selection["date"]
+
+
+@st.fragment
 def render_ephys_view(mouse=None, inventory=None):
     if not EPHYS_ROOT.exists():
         render_no_data()
@@ -8145,7 +8758,13 @@ def render_ephys_view(mouse=None, inventory=None):
     behavior_counts = {}
     behavior_bout_starts = {}
     behavior_on_site_arrivals = {}
-    if BEHAVIOR_DB.exists():
+    active_ephys_tab = st.session_state.get("ephys_tabs", "Probe selection")
+    previous_visit = st.session_state.get(f"ephys_visited_tabs_{mouse}", {})
+    keep_behavior_events = (
+        previous_visit.get("session") == st.session_state.get(f"selected_ephys_session_{mouse}")
+        and bool({"Overview", "Activity"} & previous_visit.get("tabs", set()))
+    )
+    if (active_ephys_tab in ("Probe selection", "Overview", "Replay", "Activity") or keep_behavior_events) and BEHAVIOR_DB.exists():
         try:
             counts_df = load_behavior_session_counts(
                 str(BEHAVIOR_DB),
@@ -8164,21 +8783,7 @@ def render_ephys_view(mouse=None, inventory=None):
             behavior_bout_starts = {}
             behavior_on_site_arrivals = {}
 
-    atlas_mesh_path = ATLAS_DIR / "meshes" / "997.obj"
     annotation_path = ATLAS_DIR / "annotation.tiff"
-    if not atlas_mesh_path.exists():
-        st.error(f"Allen atlas mesh not found: {atlas_mesh_path}")
-        st.info("Set APP_ATLAS_DIR to the local allen_mouse_25um_v1.2 atlas directory.")
-        return
-    brain_mesh = load_obj_mesh(str(atlas_mesh_path), atlas_mesh_signature(atlas_mesh_path))
-    region_meshes = {}
-    for region, structure_id in {"MOs": 993, "STR": 477, "CP": 672}.items():
-        region_mesh_path = ATLAS_DIR / "meshes" / f"{structure_id}.obj"
-        if region_mesh_path.exists():
-            region_meshes[region] = load_obj_mesh(
-                str(region_mesh_path),
-                atlas_mesh_signature(region_mesh_path),
-            )
 
     selected_key = f"selected_ephys_session_{mouse}"
     if st.session_state.get(selected_key) not in selected_sessions:
@@ -8192,120 +8797,93 @@ def render_ephys_view(mouse=None, inventory=None):
         atlas_probe_key, atlas_probe_options[0] if atlas_probe_options else None
     )
 
-    top_panel = st.container(border=True, key="atlas_session_panel")
-    top_panel.markdown(
-        '<div class="section-card-title">Probe selection</div>',
-        unsafe_allow_html=True,
+    if st.session_state.get("ephys_tabs") == "Histologie":
+        st.session_state["ephys_tabs"] = "Histology"
+    for tab_state_key in ("ephys_tabs", "_dashboard_tab_selection_ephys_tabs"):
+        if st.session_state.get(tab_state_key) == "Replay":
+            st.session_state[tab_state_key] = "Overview"
+        elif st.session_state.get(tab_state_key) in ("Anatomy", "Probe profile"):
+            st.session_state[tab_state_key] = "Quality control"
+    selection_tab, replay_tab, histology_tab, activity_tab, quality_tab = dashboard_tabs(
+        ["Probe selection", "Overview", "Histology", "Activity", "Quality control"],
+        key="ephys_tabs",
     )
-    atlas_col, cards_col = top_panel.columns([1.62, 1.38], gap="large")
-    with atlas_col:
-        with st.container(border=False):
-            atlas_figure = build_probe_figure(
-                tracks,
-                brain_mesh,
-                region_meshes,
-                selected_session=st.session_state[selected_key],
-                selected_probe=atlas_selected_probe,
-                annotation_path=str(annotation_path) if annotation_path.exists() else None,
-                height=430,
-                annotation_signature=source_signature(annotation_path) if annotation_path.exists() else None,
-            )
-            st.plotly_chart(
-                atlas_figure,
-                width="stretch",
-                key=f"probe_atlas_view_{mouse}_{atlas_session}_{atlas_selected_probe}",
-                config={
-                    "displaylogo": False,
-                    "scrollZoom": True,
-                    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-                },
+    visit_key = f"ephys_visited_tabs_{mouse}"
+    visited = st.session_state.get(visit_key, {})
+    if visited.get("session") != atlas_session:
+        visited = {"session": atlas_session, "tabs": set()}
+    for label, tab in (("Overview", replay_tab), ("Activity", activity_tab),
+                       ("Quality control", quality_tab)):
+        if tab.open:
+            visited["tabs"].add(label)
+    st.session_state[visit_key] = visited
+    render_overview = "Overview" in visited["tabs"]
+    render_activity = "Activity" in visited["tabs"]
+    render_quality = "Quality control" in visited["tabs"]
+    histology_visit_key = f"ephys_histology_visited_{mouse}"
+    if histology_tab.open:
+        st.session_state[histology_visit_key] = True
+
+    scene_key = f"probe_selection_scene_cache_{mouse}"
+    scene_signature = channel_locations_signature(selected_inventory)
+    with selection_tab:
+        # Keep a visited scene mounted while another tab is visible.
+        if selection_tab.open or scene_key in st.session_state:
+            cached_scene = st.session_state.get(scene_key)
+            if cached_scene is None or cached_scene["signature"] != scene_signature:
+                atlas_mesh_path = ATLAS_DIR / "meshes" / "997.obj"
+                if not atlas_mesh_path.exists():
+                    st.error(f"Allen atlas mesh not found: {atlas_mesh_path}")
+                    st.info("Set APP_ATLAS_DIR to the local allen_mouse_25um_v1.2 atlas directory.")
+                    return
+                brain_mesh = load_obj_mesh(str(atlas_mesh_path), atlas_mesh_signature(atlas_mesh_path))
+                region_meshes = {}
+                for region, structure_id in {"MOs": 993, "STR": 477, "CP": 672}.items():
+                    region_mesh_path = ATLAS_DIR / "meshes" / f"{structure_id}.obj"
+                    if region_mesh_path.exists():
+                        region_meshes[region] = load_obj_mesh(
+                            str(region_mesh_path),
+                            atlas_mesh_signature(region_mesh_path),
+                        )
+
+                atlas_figure = build_probe_figure(
+                    tracks, brain_mesh, region_meshes=region_meshes,
+                    selected_session=atlas_session, selected_probe=atlas_selected_probe,
+                    annotation_path=str(annotation_path) if annotation_path.exists() else None,
+                    height=720,
+                    annotation_signature=source_signature(annotation_path) if annotation_path.exists() else None,
+                )
+                session_cards = []
+                for session_date in selected_sessions:
+                    session_tracks = [track for track in tracks if track["date"] == session_date]
+                    probes = sorted(track["probe"] for track in session_tracks)
+                    good = sum(track["good_units"] for track in session_tracks)
+                    bouts = behavior_counts.get(session_date)
+                    session_cards.append(dict(date=session_date, probes=probes, good=good,
+                                              bouts=int(bouts) if pd.notna(bouts) else None,
+                                              color=session_color(session_date)))
+                cached_scene = dict(signature=scene_signature,
+                                    figure=json.loads(atlas_figure.to_json()), sessions=session_cards)
+                st.session_state[scene_key] = cached_scene
+            render_probe_selection_scene(
+                mouse, cached_scene["figure"], cached_scene["sessions"], selected_key,
             )
 
-    with cards_col:
-        with st.container(border=False, key="session_cards"):
-            card_columns = st.columns(2, gap="small")
-            for card_index, session_date in enumerate(selected_sessions):
-                card_color = session_color(session_date)
-                is_selected = st.session_state[selected_key] == session_date
-                button_key = f"session_option_{mouse}_{session_date}"
-                card_background = "#FFF4F1" if is_selected else "#F3F5F7"
-                card_shadow = (
-                    "0 0 0 1px rgba(240,79,71,.14), "
-                    "0 7px 16px rgba(224,76,59,.09)"
-                    if is_selected
-                    else "0 1px 3px rgba(34,50,72,0.04)"
-                )
-                st.markdown(
-                    f"""
-                    <style>
-                    .st-key-{button_key} button {{
-                        position: relative !important;
-                        width: 100% !important;
-                        min-height: 78px !important;
-                        background: {card_background} !important;
-                        border: 1.5px solid {"#F04F47" if is_selected else "#DDE3E8"} !important;
-                        border-radius: 12px !important;
-                        padding: 7px 25px 7px 10px !important;
-                        margin: 0 0 8px 0 !important;
-                        box-shadow: {card_shadow} !important;
-                        color: {NAVY} !important;
-                        justify-content: center !important;
-                        text-align: center !important;
-                        white-space: pre-line !important;
-                        line-height: 1.24 !important;
-                        font-size: .82rem !important;
-                        font-weight: 450 !important;
-                    }}
-                    .st-key-{button_key} button::before {{
-                        content: "";
-                        position: absolute;
-                        top: 0;
-                        right: 0;
-                        width: 22px;
-                        height: 22px;
-                        border-radius: 0 10px 0 8px;
-                        background: {card_color};
-                        box-shadow: none;
-                    }}
-                    .st-key-{button_key} button:hover {{
-                        background: #EEF3F7 !important;
-                        border-color: #AEBCC9 !important;
-                        box-shadow: 0 6px 15px rgba(34,50,72,.09) !important;
-                        transform: translateY(-1px);
-                    }}
-                    </style>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                session_tracks = [track for track in tracks if track["date"] == session_date]
-                probes = sorted(track["probe"] for track in session_tracks)
-                insertion = "Double insertion" if len(probes) > 1 else "Single insertion"
-                session_good = sum(track["good_units"] for track in session_tracks)
-                valid_bouts = behavior_counts.get(session_date)
-                good_value = f"{session_good}" if session_good else "—"
-                bouts_value = f"{int(valid_bouts)}" if pd.notna(valid_bouts) else "—"
-                insertion_type = "Double insertion" if len(probes) > 1 else "Single insertion"
-                label = (
-                    f"{mouse} · {session_date}  \n"
-                    f"{insertion_type}  \n"
-                    f"{good_value} good units  {bouts_value} valid bouts"
-                )
-                with card_columns[card_index % 2]:
-                    st.button(
-                        label,
-                        key=button_key,
-                        type="secondary",
-                        width="stretch",
-                        on_click=set_ephys_session,
-                        args=(selected_key, session_date),
-                    )
-        focus_session = st.session_state[selected_key]
-        session_inventory = selected_inventory[selected_inventory["date"] == focus_session]
-        probe_options = sorted(session_inventory["probe"].unique().tolist())
-        shared_probe_key = f"detail_probe_{mouse}_{focus_session}"
-        if st.session_state.get(shared_probe_key) not in probe_options:
-            st.session_state[shared_probe_key] = probe_options[0]
-        focus_probe = st.session_state[shared_probe_key]
+    with histology_tab:
+        if st.session_state.get(histology_visit_key, False):
+            render_histology_view(mouse)
+
+    if not (render_overview or render_activity or render_quality):
+        return
+
+    focus_session = st.session_state[selected_key]
+    session_inventory = selected_inventory[selected_inventory["date"] == focus_session]
+    probe_options = sorted(session_inventory["probe"].unique().tolist())
+    shared_probe_key = f"detail_probe_{mouse}_{focus_session}"
+    if st.session_state.get(shared_probe_key) not in probe_options:
+        st.session_state[shared_probe_key] = probe_options[0]
+    focus_probe = st.session_state[shared_probe_key]
+
 
     st.markdown("<div style='height: 22px;'></div>", unsafe_allow_html=True)
     focus_probe = focus_probe or probe_options[0]
@@ -8317,13 +8895,14 @@ def render_ephys_view(mouse=None, inventory=None):
     selected_behavior_arrivals = behavior_on_site_arrivals.get(
         focus_session, np.array([])
     )
-    if BEHAVIOR_DB.exists():
+    if (render_overview or render_activity) and BEHAVIOR_DB.exists():
         behavior_signature = source_signature(BEHAVIOR_DB)
         behavior_database_index, behavior_version = ephys_behavior_selection(
             selected_row["session_dir"], focus_probe
         )
         if behavior_database_index is not None or behavior_version is not None:
-            behavior_row = load_behavior_video_session(
+            behavior_loader = load_behavior_video_session if render_overview else load_ephys_behavior_events
+            behavior_row = behavior_loader(
                 str(BEHAVIOR_DB),
                 behavior_signature,
                 mouse,
@@ -8347,200 +8926,272 @@ def render_ephys_view(mouse=None, inventory=None):
                 selected_behavior_arrivals = selected_behavior_arrivals[
                     np.isfinite(selected_behavior_arrivals)
                 ]
-    analysis = load_probe_analysis(
-        str(locations_path),
-        probe_analysis_signature(
-            locations_path,
+    analysis_signature = probe_analysis_signature(locations_path, selected_row["session_dir"], focus_probe)
+    analysis_context = (str(locations_path), selected_row["source"], focus_probe,
+                        analysis_signature, tuple(selected_behavior_arrivals) if (render_overview or render_activity) else (),
+                        render_overview or render_activity)
+    retained_analysis_key = f"ephys_retained_analysis_{mouse}"
+    retained_analysis = st.session_state.get(retained_analysis_key)
+    if retained_analysis is not None and retained_analysis["context"] == analysis_context:
+        analysis = retained_analysis["data"]
+    else:
+        analysis = load_probe_analysis(
+            str(locations_path),
+            probe_analysis_signature(
+                locations_path,
+                selected_row["session_dir"],
+                focus_probe,
+            ),
+            selected_row["source"],
             selected_row["session_dir"],
             focus_probe,
-        ),
-        selected_row["source"],
-        selected_row["session_dir"],
-        focus_probe,
-        selected_behavior_arrivals,
-    )
+            selected_behavior_arrivals if (render_overview or render_activity) else (),
+            include_activity=render_overview or render_activity,
+        )
+        st.session_state[retained_analysis_key] = dict(context=analysis_context, data=analysis)
     units = analysis["units"]
     good_count = int((units["bombcell_label"] == "good").sum())
     good_percent = 100 * good_count / len(units) if len(units) else 0
     alignment = analysis["alignment"]
 
-    with section_card("Replay"):
-        if not BEHAVIOR_DB.exists():
-            st.info("Behavioral database unavailable for this replay.")
-        else:
-            behavior_signature = source_signature(BEHAVIOR_DB)
-            # New alignments identify the exact behavior row chosen from all
-            # same-day candidates. Only legacy JSON files fall back to the
-            # historical "highest Version" behavior.
-            if behavior_row is None and behavior_database_index is None and behavior_version is None:
-                video_index = load_behavior_video_index(str(BEHAVIOR_DB), behavior_signature)
-                session_match = video_index[
-                    (video_index["Mouse_ID"] == mouse) & (video_index["Date"] == focus_session)
-                ]
-                if not session_match.empty:
-                    behavior_version = str(session_match.iloc[-1]["Version"])
-                    behavior_row = load_behavior_video_session(
-                        str(BEHAVIOR_DB), behavior_signature, mouse,
-                        focus_session, behavior_version,
-                    )
-            if behavior_row is None:
-                st.info("No behavioral recording matches this ephys session.")
-            else:
-                replay_payload = build_behavior_replay_payload(
-                    behavior_row, mouse, focus_session
-                ) if behavior_row is not None else None
-                if replay_payload is None:
-                    st.info("Position and speed signals are not available for this session.")
+    with replay_tab:
+        if render_overview:
+            with st.container(key="ephys_replay_compact"), behavior_section_card("Session focus"):
+                st.html("""<style>
+                .st-key-ephys_replay_compact [data-testid="stVerticalBlock"] {gap:12px !important;}
+                .st-key-ephys_replay_compact .behavior-overview-card {padding:8px 12px !important;min-height:54px !important;}
+                .st-key-ephys_replay_compact .behavior-overview-grid {margin-bottom:8px !important;gap:12px !important;}
+                .st-key-ephys_replay_compact .behavior-overview-value {font-size:.95rem !important;}
+                .st-key-ephys_replay_compact .behavior-subtitle {font-size:.85rem;margin-bottom:2px;}
+                </style>""")
+                if not BEHAVIOR_DB.exists():
+                    st.info("Behavioral database unavailable for this replay.")
                 else:
-                    probe_activity_items = []
-                    for probe_row in session_inventory.itertuples(index=False):
-                        probe_name = str(probe_row.probe)
-                        if probe_name == focus_probe:
-                            probe_analysis = analysis
-                        else:
-                            probe_locations_path = Path(probe_row.path)
-                            probe_analysis = load_probe_analysis(
-                                str(probe_locations_path),
-                                probe_analysis_signature(
-                                    probe_locations_path,
-                                    probe_row.session_dir,
-                                    probe_name,
-                                ),
-                                probe_row.source,
-                                probe_row.session_dir,
-                                probe_name,
-                                selected_behavior_arrivals,
-                            )
-                        probe_activity_items.append(
-                            {
-                                "probe": probe_name,
-                                "regional_activity": probe_analysis.get("regional_activity"),
-                                "atlas_regions": sorted({
-                                    str(region)
-                                    for region in probe_analysis["channels"]["brain_region"].dropna()
-                                    if str(region).lower() != "unknown"
-                                }),
-                                "alignment": probe_analysis.get("alignment", {}),
-                            }
-                        )
-                    replay_payload = attach_ephys_to_replay(
-                        replay_payload, probe_activity_items,
-                    )
-                    structures_path = ATLAS_DIR / "structures.csv"
-                    replay_regions = tuple(sorted({
-                        region
-                        for item in probe_activity_items
-                        for region in (item.get("regional_activity") or {}).get("regions", {})
-                    }))
-                    if annotation_path.exists() and structures_path.exists():
-                        session_track_coordinates = [
-                            track["coordinates"] for track in tracks
-                            if track["date"] == focus_session and len(track["coordinates"])
+                    behavior_signature = source_signature(BEHAVIOR_DB)
+                    # New alignments identify the exact behavior row chosen from all
+                    # same-day candidates. Only legacy JSON files fall back to the
+                    # historical "highest Version" behavior.
+                    if behavior_row is None and behavior_database_index is None and behavior_version is None:
+                        video_index = load_behavior_video_index(str(BEHAVIOR_DB), behavior_signature)
+                        session_match = video_index[
+                            (video_index["Mouse_ID"] == mouse) & (video_index["Date"] == focus_session)
                         ]
-                        default_ap_frame = (
-                            float(np.nanmean(np.concatenate(session_track_coordinates)[:, 0])) / 25
-                            if session_track_coordinates else 264.0
-                        )
-                        replay_payload["atlasSlices"] = build_replay_atlas_slices(
-                            str(annotation_path), source_signature(annotation_path),
-                            str(structures_path), source_signature(structures_path),
-                            replay_regions, default_ap_frame,
-                        )
-                    components.html(
-                        build_behavior_replay_html(replay_payload),
-                        height=880,
-                        scrolling=False,
-                    )
-
-    with section_card("Anatomy"):
-        render_probe_selector("Anatomy", probe_options, shared_probe_key)
-        probe_profile = build_probe_anatomy_figure(analysis["channels"], units)
-        if probe_profile is None:
-            st.info("Channel anatomy is not available for this probe.")
-        else:
-            st.markdown('<div class="subplot-title anatomy-subtitle">Probe anatomy</div>', unsafe_allow_html=True)
-            st.plotly_chart(probe_profile, width="stretch", config={"displayModeBar": False})
-
-    with section_card("Activity"):
-        render_probe_selector("Activity", probe_options, shared_probe_key)
-        with st.container(border=False, key="activity_viewer"):
-            if analysis["activity_heatmap"] is None:
-                st.info("Good-unit spike clusters are not available for this probe.")
-            else:
-                activity_left, activity_right = st.columns([1.22, 1], gap="large")
-                with activity_left:
-                    st.markdown('<div class="subplot-title">Good-unit activity</div>', unsafe_allow_html=True)
-                    st.plotly_chart(
-                        build_activity_heatmap(
-                            analysis["activity_heatmap"],
-                            behavior_bout_starts.get(focus_session, np.array([])),
-                            height=430,
-                        ),
-                        width="stretch",
-                        key=f"activity_chart_{mouse}_{focus_session}_{focus_probe}",
-                        config={
-                            "displayModeBar": False,
-                            "displaylogo": False,
-                            "scrollZoom": False,
-                        },
-                    )
-                with activity_right:
-                    if analysis["peri_bout"] is None:
-                        st.info("Arrival-aligned activity is unavailable for this probe.")
+                        if not session_match.empty:
+                            behavior_version = str(session_match.iloc[-1]["Version"])
+                            behavior_row = load_behavior_video_session(
+                                str(BEHAVIOR_DB), behavior_signature, mouse,
+                                focus_session, behavior_version,
+                            )
+                    if behavior_row is None:
+                        st.info("No behavioral recording matches this ephys session.")
                     else:
+                        render_behavior_session_info(behavior_session_info_values(behavior_row))
+                        replay_payload = build_behavior_replay_payload(
+                            behavior_row, mouse, focus_session
+                        ) if behavior_row is not None else None
+                        if replay_payload is None:
+                            st.info("Position and speed signals are not available for this session.")
+                        else:
+                            probe_activity_items = []
+                            for probe_row in session_inventory.itertuples(index=False):
+                                probe_name = str(probe_row.probe)
+                                if probe_name == focus_probe:
+                                    probe_analysis = analysis
+                                else:
+                                    probe_locations_path = Path(probe_row.path)
+                                    probe_analysis = load_probe_analysis(
+                                        str(probe_locations_path),
+                                        probe_analysis_signature(
+                                            probe_locations_path,
+                                            probe_row.session_dir,
+                                            probe_name,
+                                        ),
+                                        probe_row.source,
+                                        probe_row.session_dir,
+                                        probe_name,
+                                        selected_behavior_arrivals,
+                                    )
+                                probe_activity_items.append(
+                                    {
+                                        "probe": probe_name,
+                                        "regional_activity": probe_analysis.get("regional_activity"),
+                                        "atlas_regions": sorted({
+                                            str(region)
+                                            for region in probe_analysis["channels"]["brain_region"].dropna()
+                                            if str(region).lower() != "unknown"
+                                        }),
+                                        "alignment": probe_analysis.get("alignment", {}),
+                                    }
+                                )
+                            replay_payload = attach_ephys_to_replay(
+                                replay_payload, probe_activity_items,
+                            )
+                            structures_path = ATLAS_DIR / "structures.csv"
+                            replay_regions = tuple(sorted({
+                                region
+                                for item in probe_activity_items
+                                for region in (item.get("regional_activity") or {}).get("regions", {})
+                            }))
+                            if annotation_path.exists() and structures_path.exists():
+                                session_track_coordinates = [
+                                    track["coordinates"] for track in tracks
+                                    if track["date"] == focus_session and len(track["coordinates"])
+                                ]
+                                default_ap_frame = (
+                                    float(np.nanmean(np.concatenate(session_track_coordinates)[:, 0])) / 25
+                                    if session_track_coordinates else 264.0
+                                )
+                                replay_payload["atlasSlices"] = build_replay_atlas_slices(
+                                    str(annotation_path), source_signature(annotation_path),
+                                    str(structures_path), source_signature(structures_path),
+                                    replay_regions, default_ap_frame,
+                                )
+                            components.html(
+                                build_behavior_replay_html(replay_payload, compact=True),
+                                height=460,
+                                scrolling=False,
+                            )
+                        st.html("<div style='height:32px'></div>")
+                        timeline_area, analysis_area = st.columns(2, gap="medium")
+                        with timeline_area:
+                            behavior_plot_card(
+                                "Behavioral timeline",
+                                build_behavior_session_plot(behavior_row, "session_timeline"),
+                                height=190, compact=True,
+                            )
+                        with analysis_area:
+                            rewards_area, failures_area = st.columns(2, gap="medium")
+                            with rewards_area:
+                                behavior_plot_card(
+                                    "Rewards vs consecutive failures",
+                                    build_behavior_session_plot(behavior_row, "session_rewards_failures"),
+                                    height=190, compact=True,
+                                )
+                            with failures_area:
+                                behavior_plot_card(
+                                    "Failure distribution",
+                                    build_behavior_session_plot(behavior_row, "session_failure_distribution"),
+                                    height=190, compact=True,
+                                )
+
+    with activity_tab:
+        if render_activity:
+            with section_card("Activity"):
+                activity_rows = session_inventory.sort_values("probe").drop_duplicates("probe")
+                chart_height = 280 if len(activity_rows) > 1 else 430
+                for probe_row in activity_rows.itertuples(index=False):
+                    probe_name = str(probe_row.probe)
+                    if probe_name == focus_probe:
+                        probe_analysis = analysis
+                    else:
+                        probe_locations_path = Path(probe_row.path)
+                        probe_analysis = load_probe_analysis(
+                            str(probe_locations_path),
+                            probe_analysis_signature(probe_locations_path, probe_row.session_dir, probe_name),
+                            probe_row.source, probe_row.session_dir, probe_name,
+                            selected_behavior_arrivals, include_activity=True,
+                        )
+                    activity_left, activity_right = st.columns([1.22, 1], gap="large")
+                    with activity_left:
                         st.markdown(
-                            '<div class="subplot-title">Arrival on site</div>',
+                            f'<div class="subplot-title">{probe_name} · Good-unit activity</div>',
                             unsafe_allow_html=True,
                         )
+                        if probe_analysis["activity_heatmap"] is None:
+                            st.info("Good-unit spike clusters are not available for this probe.")
+                        else:
+                            st.plotly_chart(
+                                build_activity_heatmap(
+                                    probe_analysis["activity_heatmap"],
+                                    behavior_bout_starts.get(focus_session, np.array([])),
+                                    height=chart_height,
+                                ),
+                                width="stretch",
+                                key=f"activity_chart_{mouse}_{focus_session}_{probe_name}",
+                                config={"displayModeBar": False, "displaylogo": False, "scrollZoom": False},
+                            )
+                    with activity_right:
+                        st.markdown(
+                            f'<div class="subplot-title">{probe_name} · Arrival on site</div>',
+                            unsafe_allow_html=True,
+                        )
+                        if probe_analysis["peri_bout"] is None:
+                            st.info("Arrival-aligned activity is unavailable for this probe.")
+                        else:
+                            st.plotly_chart(
+                                build_peri_bout_figure(probe_analysis["peri_bout"], height=chart_height),
+                                width="stretch",
+                                key=f"peri_bout_chart_{mouse}_{focus_session}_{probe_name}",
+                                config={"displayModeBar": False, "displaylogo": False, "scrollZoom": False},
+                            )
+
+    with quality_tab:
+        if render_quality:
+            with section_card("Quality control"):
+                render_probe_selector("Quality control", probe_options, shared_probe_key)
+                qc_left, qc_right = st.columns(2, gap="large")
+                with qc_left:
+                    st.markdown('<div class="subplot-title">Bombcell classification</div>', unsafe_allow_html=True)
+                    qc_figure = build_qc_figure(units)
+                    qc_figure.update_layout(height=290)
+                    st.plotly_chart(qc_figure, width="stretch", config={"displayModeBar": False})
+                with qc_right:
+                    st.markdown('<div class="subplot-title">QC criterion selectivity</div>', unsafe_allow_html=True)
+                    qc_selectivity = build_qc_selectivity_figure(units)
+                    if qc_selectivity is None:
+                        st.info("QC metrics are unavailable for this probe.")
+                    else:
+                        qc_selectivity.update_layout(height=290)
                         st.plotly_chart(
-                            build_peri_bout_figure(analysis["peri_bout"], height=430),
-                            width="stretch",
-                            key=f"peri_bout_chart_{mouse}_{focus_session}_{focus_probe}",
-                            config={"displayModeBar": False, "displaylogo": False, "scrollZoom": False},
+                            qc_selectivity, width="stretch", config={"displayModeBar": False}
                         )
 
-    with section_card("Quality control"):
-        render_probe_selector("Quality control", probe_options, shared_probe_key)
-        qc_left, qc_right = st.columns(2, gap="large")
-        with qc_left:
-            st.markdown('<div class="subplot-title">Bombcell classification</div>', unsafe_allow_html=True)
-            st.plotly_chart(build_qc_figure(units), width="stretch", config={"displayModeBar": False})
-        with qc_right:
-            st.markdown('<div class="subplot-title">QC criterion selectivity</div>', unsafe_allow_html=True)
-            qc_selectivity = build_qc_selectivity_figure(units)
-            if qc_selectivity is None:
-                st.info("QC metrics are unavailable for this probe.")
-            else:
-                st.plotly_chart(
-                    qc_selectivity, width="stretch", config={"displayModeBar": False}
+                from dashboard import raw_qc as raw_qc_module
+                if getattr(raw_qc_module, "RAW_QC_VERSION", 0) < 6:
+                    import importlib
+                    raw_qc_module = importlib.reload(raw_qc_module)
+                raw_qc_module.render_raw_qc(selected_row["session_dir"], focus_probe)
+
+                st.markdown('<div class="subplot-title">Probe profile</div>', unsafe_allow_html=True)
+                segments, profile_good, region_summary = prepare_profile(analysis["channels"], units)
+                available_metrics = [name for name in PROFILE_METRICS
+                                     if name in profile_good and pd.to_numeric(profile_good[name], errors="coerce").notna().any()]
+                available_metrics = available_metrics or ["firing_rate"]
+                available_metrics.append("good_units")
+                metric_key = f"probe_profile_metric_{mouse}"
+                if st.session_state.get(metric_key) not in available_metrics:
+                    st.session_state[metric_key] = available_metrics[0]
+                profile_metric = st.selectbox(
+                    "Unit metric", available_metrics, format_func=PROFILE_METRICS.get, key=metric_key, label_visibility="collapsed",
                 )
+                profile_figure = build_profile_figure(segments, profile_good, brain_region_color, metric=profile_metric, region_summary=region_summary)
+                if profile_figure is None:
+                    st.info("Channel depths are not available for this probe.")
+                else:
+                    st.plotly_chart(profile_figure, width="stretch", config={"displayModeBar": False})
 
-        st.markdown('<div class="subplot-title">Unit explorer</div>', unsafe_allow_html=True)
-        display_columns = [
-            column
-            for column in [
-                "unit_id",
-                "bombcell_label",
-                "brain_region",
-                "depth_um",
-                "num_spikes",
-                "firing_rate",
-                "snr",
-                "presence_ratio",
-                "rp_contamination",
-                "amplitude_median",
-                "drift_ptp",
-            ]
-            if column in units.columns
-        ]
-        dataframe_card(units[display_columns])
+                st.markdown('<div class="subplot-title">Unit explorer</div>', unsafe_allow_html=True)
+                display_columns = [
+                    column
+                    for column in [
+                        "unit_id",
+                        "bombcell_label",
+                        "brain_region",
+                        "depth_um",
+                        "num_spikes",
+                        "firing_rate",
+                        "snr",
+                        "presence_ratio",
+                        "rp_contamination",
+                        "amplitude_median",
+                        "drift_ptp",
+                    ]
+                    if column in units.columns
+                ]
+                st.dataframe(units[display_columns], height=360, width="stretch", hide_index=True)
 
 
 
-page_loading = st.empty()
-info_quick_rerun = st.session_state.pop("_info_quick_rerun", False)
-if st.session_state.get(NAVIGATION_STATE_KEY) != "Info" or not info_quick_rerun:
-    page_loading.markdown(loading_mouse_markup(), unsafe_allow_html=True)
 try:
     inject_css()
     if st.session_state.get(NAVIGATION_STATE_KEY) not in VIEW_OPTIONS:
@@ -8555,52 +9206,18 @@ try:
     prepared_openfield_inventory = None
     default_navigation_mouse = None
     selected_view = st.session_state[NAVIGATION_STATE_KEY]
-    navigation_shell = st.container(border=False, key="navigation_fixed_shell")
-    with navigation_shell:
-        navigation_bar_column, mouse_column = st.columns(
-            [6, 1], gap="medium", vertical_alignment="center",
-        )
-        with navigation_bar_column:
-            with st.container(border=True, key="app_navigation"):
-                navigation_columns = st.columns(6, gap=None, vertical_alignment="center")
-                for navigation_column, view in zip(navigation_columns, VIEW_OPTIONS):
-                    with navigation_column:
-                        st.button(
-                            VIEW_LABELS[view], key=f"global_nav_{view.lower()}",
-                            type="primary" if selected_view == view else "secondary",
-                            width="stretch", on_click=set_global_view, args=(view,),
-                        )
 
     if selected_view == "Electrophysiology":
         prepared_inventory = discover_ibl_channel_locations(EPHYS_ROOT)
-        mouse_options = (
-            sorted(
-                mouse for mouse in prepared_inventory["mouse"].unique().tolist()
-                if is_visible_mouse(mouse)
-            )
-            if not prepared_inventory.empty else []
-        )
+        mouse_options = mice_by_latest_session(prepared_inventory, "mouse", "date")
     elif selected_view == "Openfield":
         prepared_openfield_inventory = discover_openfield_sessions(OPENFIELD_ROOT)
-        mouse_options = (
-            sorted(prepared_openfield_inventory["mouse"].unique().tolist())
-            if not prepared_openfield_inventory.empty else []
-        )
+        mouse_options = mice_by_latest_session(prepared_openfield_inventory, "mouse", "date")
     elif BEHAVIOR_DB.exists():
-        navigation_dataframe = load_behavior_database(
+        navigation_dataframe = load_behavior_catalog(
             str(BEHAVIOR_DB), source_signature(BEHAVIOR_DB)
         )
-        mouse_options = sorted(
-            mouse for mouse in navigation_dataframe["Mouse_ID"].dropna().unique().tolist()
-            if is_visible_mouse(mouse)
-        )
-        latest_per_mouse = navigation_dataframe.groupby(
-            "Mouse_ID", dropna=False
-        )["Date"].max().dropna()
-        default_navigation_mouse = (
-            latest_per_mouse.idxmax() if not latest_per_mouse.empty
-            else mouse_options[0] if mouse_options else None
-        )
+        mouse_options = mice_by_latest_session(navigation_dataframe)
     else:
         mouse_options = []
 
@@ -8610,10 +9227,16 @@ try:
     available_mice = set(mouse_options)
     global_mouse = st.session_state.get("global_mouse")
     if global_mouse is not None and global_mouse not in mouse_options:
-        mouse_options = sorted([*mouse_options, global_mouse])
+        mouse_options = [*mouse_options, global_mouse]
 
     selected_mouse = global_mouse
-    with mouse_column:
+    with st.sidebar:
+        for view in VIEW_OPTIONS:
+            st.button(
+                VIEW_LABELS[view], key=f"global_nav_{view.lower()}",
+                type="primary" if selected_view == view else "secondary",
+                width="stretch", on_click=set_global_view, args=(view,),
+            )
         if selected_view in {"Home", "Chatbot"}:
             pass
         elif mouse_options:
@@ -8632,49 +9255,45 @@ try:
             st.session_state["global_mouse"] = selected_mouse
         else:
             st.markdown(
-                '<div style="height:58px;display:flex;align-items:center;'
+                '<div style="height:40px;display:flex;align-items:center;'
                 'justify-content:center;color:#748091;font-size:.80rem;">No mouse</div>',
                 unsafe_allow_html=True,
             )
 
-    st.markdown('<div class="navigation-flow-spacer"></div>', unsafe_allow_html=True)
+    # Native Streamlit owns replacement of the page and fragment contents.
+    with st.container(key=f"page_{selected_view.lower()}"):
+        if selected_view == "Home":
+            render_home_view()
+        elif selected_view == "Info":
+            info_behavior_metrics = load_info_behavior_metrics(
+                str(BEHAVIOR_DB), source_signature(BEHAVIOR_DB), selected_mouse
+            ) if BEHAVIOR_DB.exists() else None
+            render_info_view(
+                selected_mouse, navigation_dataframe,
+                behavior_details=info_behavior_metrics,
+            )
+        elif selected_view == "Chatbot":
+            render_chatbot_view(selected_mouse)
+        elif selected_mouse is not None and selected_mouse not in available_mice:
+            render_no_data()
+        elif selected_view == "Openfield":
+            render_openfield_view(selected_mouse, prepared_openfield_inventory)
+        elif selected_view == "Electrophysiology":
+            render_ephys_view(selected_mouse, prepared_inventory)
+        else:
+            render_behavior_view(selected_view, selected_mouse)
 
-    if st.session_state.pop("_scroll_to_top_requested", False):
-        components.html(
-            """
-            <script>
-            (() => {
-              const doc = window.parent.document;
-              const app = doc.querySelector('[data-testid="stAppViewContainer"]');
-              if (app) app.scrollTop = 0;
-              doc.documentElement.scrollTop = 0;
-              doc.body.scrollTop = 0;
-              window.parent.scrollTo(0, 0);
-            })();
-            </script>
-            """,
-            height=0,
-            scrolling=False,
+    # Cache warming is data-only and does not affect rendering.
+
+    if selected_view == "Home" and BEHAVIOR_DB.exists():
+        prefetch_recent_info(navigation_dataframe)
+        recent_path = str(BEHAVIOR_DB)
+        recent_signature = source_signature(BEHAVIOR_DB)
+        data_prefetcher().submit(
+            ("recent-behavior-mice", recent_path, recent_signature),
+            lambda path=recent_path, signature=recent_signature: load_recent_behavior_mice(path, signature),
         )
-
-    if selected_view == "Home":
-        render_home_view()
-    elif selected_view == "Info":
-        render_info_view(selected_mouse, navigation_dataframe)
-    elif selected_view == "Chatbot":
-        render_chatbot_view(selected_mouse)
-    elif selected_mouse is not None and selected_mouse not in available_mice:
-        render_no_data()
-    elif selected_view == "Openfield":
-        render_openfield_view(selected_mouse, prepared_openfield_inventory)
-    elif selected_view == "Electrophysiology":
-        render_ephys_view(selected_mouse, prepared_inventory)
-    else:
-        render_behavior_view(selected_view, selected_mouse)
 
 except Exception as error:
     st.error("Application failed")
     st.exception(error)
-
-finally:
-    page_loading.empty()

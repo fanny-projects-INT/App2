@@ -1,6 +1,6 @@
 import unittest
 
-from normalize import session_to_row
+from normalize import _probabilities, session_to_row
 
 
 class NormalizeSessionTests(unittest.TestCase):
@@ -35,6 +35,7 @@ class NormalizeSessionTests(unittest.TestCase):
         self.assertEqual(row["experimentalist"], "experimenter")
         self.assertEqual(row["recording_type"], "Neuropixel")
         self.assertEqual(row["training_type"], "Task")
+        self.assertEqual(row["session_probabilities"], "90/10")
         self.assertEqual(row["valid_bouts"], 18.0)
         self.assertEqual(row["poops_number"], 3.0)
         self.assertEqual(row["bout_rate_per_min"], 1.0)
@@ -51,6 +52,14 @@ class NormalizeSessionTests(unittest.TestCase):
         self.assertIsNone(row["tube"])
         self.assertIsNone(row["headfix"])
         self.assertIsNone(row["comfort_on_treadmill"])
+
+    def test_probability_formats_are_consistent(self):
+        self.assertEqual(
+            _probabilities({}, {"reward_probability": 0.9, "switch_probability": 0.3}),
+            "90/30",
+        )
+        self.assertEqual(_probabilities({}, {"probas": "90/30; 45/15"}), "90/30 · 45/15")
+        self.assertEqual(_probabilities({}, {"probas": "90/00 -blue"}), "90/00 · Blue")
 
 
 if __name__ == "__main__":

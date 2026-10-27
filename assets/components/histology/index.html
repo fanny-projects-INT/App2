@@ -1,0 +1,68 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+:root{font:14px system-ui;color:#334155}*{box-sizing:border-box}body{margin:0;background:transparent}
+.layout{display:grid;grid-template-columns:190px minmax(0,1fr);gap:24px;padding:8px}
+fieldset{background:rgba(255,255,255,.72);border:1px solid #dce3ea;border-radius:10px;padding:14px;margin:0 0 18px}.panel-title{font-size:14px;font-weight:600;margin:0 0 10px}label{display:block;margin:9px 0}small{color:#64748b}
+.dual-range{position:relative;height:30px;margin:12px 0;background:linear-gradient(#cbd5e1,#cbd5e1) center/100% 4px no-repeat}
+.dual-range input{position:absolute;inset:0;width:100%;height:30px;margin:0;background:transparent;pointer-events:none;appearance:none;-webkit-appearance:none}
+.dual-range input::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:17px;height:17px;border-radius:50%;background:#64748b;border:2px solid white;box-shadow:0 0 0 1px #64748b;pointer-events:auto;cursor:grab}
+.dual-range input::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:#64748b;border:2px solid white;pointer-events:auto;cursor:grab}.dual-range input::-moz-range-track{background:transparent}
+input:focus-visible{outline:2px solid #94a3b8}
+.view{display:grid;grid-template-columns:minmax(0,1fr) 60px;gap:16px;align-items:center;min-width:0;height:800px}
+.image-area{min-width:0;display:flex;align-items:center;justify-content:center;height:100%}
+canvas{display:block;width:min(100%,780px);height:auto;aspect-ratio:1;object-fit:contain;background:#000;border-radius:5px}
+.slice{display:flex;flex-direction:column;align-items:center;gap:12px;width:60px}
+#coronal{writing-mode:vertical-lr;direction:rtl;width:28px;height:480px;accent-color:#64748b}
+@media(max-width:760px){.layout{grid-template-columns:145px minmax(0,1fr);gap:12px}fieldset{padding:10px}canvas{max-width:480px}.view{height:500px}#coronal{height:350px}}
+</style></head><body><div class="layout"><div>
+<fieldset><h3 class="panel-title">Display</h3><label><input type="checkbox" id="c0" checked> Tissue</label><label><input type="checkbox" id="c1" checked> Probe</label></fieldset>
+<fieldset><h3 class="panel-title">Tissue contrast</h3><div class="dual-range"><input aria-label="Tissue contrast minimum" id="lo0" type="range" min="0" max="255" value="0"><input aria-label="Tissue contrast maximum" id="hi0" type="range" min="0" max="255" value="255"></div><small id="range0">0 – 255</small></fieldset>
+<fieldset><h3 class="panel-title">Probe contrast</h3><div class="dual-range"><input aria-label="Probe contrast minimum" id="lo1" type="range" min="0" max="255" value="80"><input aria-label="Probe contrast maximum" id="hi1" type="range" min="0" max="255" value="255"></div><small id="range1">80 &#8211; 255</small></fieldset>
+</div><div class="view"><div class="image-area"><canvas id="view" width="1140" height="1140"></canvas></div><div class="slice"><input aria-label="Coronal slice" id="coronal" type="range" min="0" max="527" step="1"><small id="position"></small></div></div></div>
+<script>
+const get=id=>document.getElementById(id),canvas=get('view'),ctx=canvas.getContext('2d'),slider=get('coronal');
+const frameCanvas=document.createElement('canvas'),frameContext=frameCanvas.getContext('2d');
+let inFlight=false,preview=null,detail=null,index=264,count=528,initialized=false,pointerDown=false,queued=false,settleTimer=null,lastRequested=-1,error=null;
+function send(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*');}
+function requestDetail(force=false){if(pointerDown)return;const selected=+slider.value;if(inFlight&&!force)return;if(selected===lastRequested&&!force)return;lastRequested=selected;inFlight=true;send('streamlit:setComponentValue',{value:{index:selected,need_preview:!preview}});}
+function schedule(){if(!queued){queued=true;requestAnimationFrame(render);}}
+function render(){queued=false;index=+slider.value;get('position').textContent=(index+1)+' / '+count;
+ const hd=!pointerDown&&detail&&detail.index===index;const data=hd?detail:preview;
+ if(!data){ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);return;}
+ const w=data.width,h=data.height,pixels=data.pixels;
+ const output=frameContext.createImageData(w,h),lo=[+get('lo0').value,+get('lo1').value],hi=[+get('hi0').value,+get('hi1').value],on=[get('c0').checked,get('c1').checked];
+ const x0=hd?0:(index%data.columns)*w,y0=hd?0:Math.floor(index/data.columns)*h,stride=data.sheetWidth;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+  const src=((y+y0)*stride+x+x0)*4,dst=(y*w+x)*4;
+  const a=on[0]?Math.round(255*Math.max(0,Math.min(1,(pixels[src]-lo[0])/Math.max(1,hi[0]-lo[0])))):0;
+  const b=on[1]?Math.round(255*Math.max(0,Math.min(1,(pixels[src+1]-lo[1])/Math.max(1,hi[1]-lo[1])))):0;
+  const probe=[b,0,0];output.data[dst]=Math.min(255,a+probe[0]);output.data[dst+1]=Math.min(255,a+probe[1]);output.data[dst+2]=Math.min(255,a+probe[2]);output.data[dst+3]=255;
+ }
+ frameCanvas.width=w;frameCanvas.height=h;frameContext.putImageData(output,0,0);
+ const originalBounds=preview&&preview.bounds[index]||[0,0,1,1];
+ const bounds=originalBounds;
+ ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+ ctx.drawImage(frameCanvas,bounds[0]*w,bounds[1]*h,bounds[2]*w,bounds[3]*h,0,0,canvas.width,canvas.height);
+ canvas.dataset.mode=hd?'detail':'preview';canvas.dataset.index=index;
+}
+function decode(payload,done){const image=new Image();image.onload=()=>{const buffer=document.createElement('canvas');buffer.width=image.width;buffer.height=image.height;const context=buffer.getContext('2d');context.drawImage(image,0,0);done({...payload,sheetWidth:image.width,pixels:context.getImageData(0,0,image.width,image.height).data});};image.onerror=()=>{error='Image unavailable';schedule();};image.src='data:image/png;base64,'+payload.image;}
+slider.addEventListener('pointerdown',()=>{pointerDown=true;clearTimeout(settleTimer);settleTimer=null;schedule();});
+slider.addEventListener('input',()=>{schedule();});
+function finish(){if(!pointerDown)return;pointerDown=false;clearTimeout(settleTimer);schedule();requestDetail();}
+window.addEventListener('pointerup',finish);window.addEventListener('pointercancel',finish);
+slider.addEventListener('change',()=>{if(!pointerDown){clearTimeout(settleTimer);schedule();requestDetail();}});
+for(let c=0;c<2;c++){
+ const low=get('lo'+c),high=get('hi'+c);
+ function update(active){if(+low.value>=+high.value){if(active===low)low.value=Math.max(0,+high.value-1);else high.value=Math.min(255,+low.value+1);}get('range'+c).textContent=low.value+' – '+high.value;schedule();}
+ low.addEventListener('input',()=>update(low));high.addEventListener('input',()=>update(high));get('c'+c).addEventListener('input',schedule);
+}
+window.addEventListener('message',event=>{
+ if(event.data.type!=='streamlit:render')return;const args=event.data.args;
+ count=args.count;slider.max=count-1;error=args.error;inFlight=false;
+ if(!initialized){slider.value=args.index;index=args.index;initialized=true;lastRequested=args.index;}
+ if(args.preview&&!preview){decode(args.preview,data=>{preview=data;data.available.forEach((exists,c)=>{get('c'+c).checked=exists;get('c'+c).disabled=!exists;});schedule();});}
+ if(args.detail){const payload=args.detail;decode(payload,data=>{if(!detail||data.index===+slider.value)detail=data;schedule();});}
+ if(!args.preview&&!preview){requestDetail(true);}else if(!pointerDown&&+slider.value!==args.index){clearTimeout(settleTimer);settleTimer=setTimeout(()=>{settleTimer=null;requestDetail();},120);}schedule();send('streamlit:setFrameHeight',{height:820});
+});
+send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',{height:820});
+</script></body></html>

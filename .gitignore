@@ -4,3 +4,8 @@ __pycache__/
 .tools/
 logs/
 *.pyc
+
+.cache/raw_qc/
+
+# Accidental expansion of the literal Windows environment-variable path.
+%SystemDrive%/

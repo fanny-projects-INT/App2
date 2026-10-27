@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $taskName = "Cazette Dashboard"
-$launcher = Join-Path $PSScriptRoot "start_public_app.ps1"
+$appDirectory = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$launcher = Join-Path $appDirectory "scripts\windows\start-public-app.ps1"
 
 if (-not (Test-Path -LiteralPath $launcher)) {
     throw "Dashboard launcher not found: $launcher"

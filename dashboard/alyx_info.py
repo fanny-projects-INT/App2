@@ -1,19 +1,31 @@
 """Mouse information from Alyx, isolated to the current Streamlit session."""
 
 import html
+from contextlib import nullcontext, contextmanager
+import hashlib
+from threading import RLock, Condition
 import re  # Kept for compatibility with Streamlit sessions running the previous view.
+from time import monotonic
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from alyx_dashboard_readonly.alyx_rest import DEFAULT_LAB, DEFAULT_URL, connect, load_raw_sessions
-from alyx_dashboard_readonly.normalize import COLUMNS, normalize_sessions
-from app_functions import count_licks
-from ui_states import render_no_data
+import alyx_dashboard_readonly.normalize as _normalize
+if getattr(_normalize, "NORMALIZE_VERSION", 0) < 3:
+    import importlib
+    _normalize = importlib.reload(_normalize)
+COLUMNS = _normalize.COLUMNS
+normalize_sessions = _normalize.normalize_sessions
+from dashboard.app_functions import count_licks
+from dashboard.behavior_overview import render_session_info
+from dashboard.ui_states import render_no_data, data_prefetcher, dashboard_tabs
 
 
-INFO_CACHE_VERSION = 5
+INFO_UI_VERSION = 17
+INFO_CACHE_VERSION = 8
+INFO_CACHE_MAX_MICE = 8
 
 
 ICONS = {
@@ -35,41 +47,37 @@ ICONS = {
 
 INFO_STYLES = """
 <style>
-.alyx-profile-band {
-    display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); align-items:stretch;
-    min-height:126px; margin:0 0 28px; border-radius:16px;
-    background:rgba(255,255,255,.62); overflow:hidden;
-}
-.alyx-profile-item {
-    min-width:0; min-height:92px; display:flex; flex-direction:column;
-    align-items:center; justify-content:center; padding:16px 18px;
-    border-left:1px solid rgba(115,137,157,.18); text-align:center;
-}
-.alyx-profile-item:first-child { border-left:0; }
-.alyx-profile-value {
-    max-width:100%; color:#223248; font-size:1.42rem; font-weight:650;
-    line-height:1.15; overflow-wrap:anywhere;
-}
-.alyx-profile-label {
-    margin-top:9px; color:#718094; font-size:.76rem; font-weight:600;
-    letter-spacing:.04em; text-transform:uppercase;
-}
-[class*="st-key-alyx_session_"] {
+[class*="st-key-alyx_card_"] {
     border-left:4px solid #F04F47 !important;
     border-radius:13px !important;
     background:rgba(255,255,255,.68) !important;
     box-shadow:0 2px 8px rgba(34,50,72,.04);
+    padding:5px 9px !important;
 }
-[class*="st-key-alyx_session_"] div[data-testid="stButton"] button {
-    min-width:42px; min-height:42px; border-radius:50%;
+[class*="st-key-alyx_card_"] div[data-testid="stButton"] button {
+    min-width:34px; min-height:34px; border-radius:50%;
     padding:0; font-size:1.05rem; font-weight:650;
 }
 .alyx-sessions-title {
     margin:2px 0 14px; color:#223248; font-size:1.28rem; font-weight:680;
 }
-.alyx-row-info { display:flex; align-items:center; gap:9px; min-width:0; }
+.alyx-row-info { display:flex; align-items:center; gap:6px; min-width:0; min-height:36px; }
+[class*="st-key-alyx_session_header_"] {
+    padding:0 !important; border:0 !important; background:transparent !important;
+}
+[class*="st-key-alyx_session_header_"] div[data-testid="stHorizontalBlock"] {
+    min-height:36px; align-items:center !important; transform:translateY(-3px);
+}
+[class*="st-key-alyx_session_header_"] div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"] {
+    min-height:36px; justify-content:center !important; gap:0 !important;
+}
+[class*="st-key-alyx_session_header_"] div[data-testid="stMarkdown"] {
+    min-height:36px; display:flex; align-items:center;
+}
+[class*="st-key-alyx_session_header_"] .stMarkdown p { margin:0 !important; }
 .alyx-row-icon {
-    width:30px; height:30px; flex:0 0 30px; display:grid; place-items:center;
+    width:24px; height:24px; flex:0 0 24px; display:grid; place-items:center;
     color:#F04F47;
 }
 .alyx-row-icon svg, .alyx-section-icon svg {
@@ -162,6 +170,14 @@ def _compact_number(value, suffix="", decimals=1):
     return f"{rendered}{suffix}"
 
 
+def _lick_reward_rate(rewarded, unrewarded):
+    rewarded = pd.to_numeric(rewarded, errors="coerce")
+    unrewarded = pd.to_numeric(unrewarded, errors="coerce")
+    if pd.isna(rewarded) or pd.isna(unrewarded) or unrewarded == 0:
+        return "—"
+    return _compact_number(100 * float(rewarded) / float(unrewarded), "%", decimals=1)
+
+
 def _friendly_datetime(value):
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
@@ -172,7 +188,38 @@ def _friendly_datetime(value):
 def _rig_number(value):
     rendered = _text(value)
     match = re.search(r"(?i)rig\s*[-_]?\s*(.+)", rendered)
-    return match.group(1) if match else rendered
+    number = match.group(1) if match else rendered
+    return f"Rig {number}" if number != "â€”" else number
+
+
+def _protocol_label(value):
+    rendered = _text(value)
+    key = re.sub(r"[^a-z0-9]+", "", rendered.lower())
+    return {
+        "vf1": "Training 1",
+        "vf2": "Training 2",
+        "vft": "Task",
+        "2ndtraining": "Training 2",
+        "task": "Task",
+        "nph": "NP habituation",
+        "npr": "NP recording",
+    }.get(key, rendered)
+
+
+def _person_label(value):
+    rendered = _text(value)
+    if rendered == "â€”":
+        return rendered
+    people = []
+    for person in rendered.split(","):
+        words = re.sub(r"[._]+", " ", person.strip()).split()
+        people.append(" ".join(word.capitalize() for word in words))
+    return " · ".join(people)
+
+
+def _date_label(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+    return parsed.strftime("%d/%m/%Y") if pd.notna(parsed) else _text(value)
 
 
 def _looks_like_uuid(value):
@@ -192,23 +239,16 @@ def _display_value(value):
     return rendered
 
 
-def _profile_band(mouse_id, subject):
+def _profile_values(mouse_id, subject):
     sex = {"M": "Male", "F": "Female", "U": "Unknown"}.get(
         str(subject.get("sex", "")).upper(), subject.get("sex")
     )
-    values = [
-        (mouse_id, "Mouse"),
-        (sex, "Sex"),
-        (subject.get("birth_date"), "Birth date"),
-        (subject.get("responsible_user"), "Responsible user"),
+    return [
+        ("MOUSE", _text(mouse_id)),
+        ("SEX", _text(sex)),
+        ("BIRTH DATE", _text(subject.get("birth_date"))),
+        ("RESPONSIBLE USER", _text(subject.get("responsible_user"))),
     ]
-    blocks = "".join(
-        '<div class="alyx-profile-item">'
-        f'<div class="alyx-profile-value">{html.escape(_text(value))}</div>'
-        f'<div class="alyx-profile-label">{label}</div></div>'
-        for value, label in values
-    )
-    return f'<div class="alyx-profile-band">{blocks}</div>'
 
 
 def _category_card(title, icon, color, items, records=None, footer=None, background="#F3F7F9"):
@@ -288,16 +328,29 @@ def _enrich_behavior_counts(data, behavior_data, mouse_id):
         matches = local[local["_info_date"] == str(session.get("date"))]
         version = session.get("version")
         if len(matches) > 1 and "Version" in matches and pd.notna(version):
-            exact = matches[matches["Version"].astype(str) == str(version)]
+            local_versions = pd.to_numeric(matches["Version"], errors="coerce")
+            alyx_version = pd.to_numeric(version, errors="coerce")
+            exact = matches[local_versions == alyx_version] if pd.notna(alyx_version) else matches[
+                matches["Version"].astype(str) == str(version)
+            ]
             if not exact.empty:
                 matches = exact
         if matches.empty:
             continue
         source = matches.iloc[-1]
+        local_valid = source.get("valid_bouts")
+        if pd.isna(session.get("valid_bouts")) and pd.notna(local_valid):
+            data.at[index, "valid_bouts"] = local_valid
+        local_rewarded = source.get("rewarded_licks")
         if pd.isna(session.get("rewarded_licks")):
-            data.at[index, "rewarded_licks"] = count_licks(source, "rewarded")
+            data.at[index, "rewarded_licks"] = (
+                local_rewarded if pd.notna(local_rewarded) else count_licks(source, "rewarded")
+            )
+        local_unrewarded = source.get("unrewarded_licks")
         if pd.isna(session.get("unrewarded_licks")):
-            data.at[index, "unrewarded_licks"] = count_licks(source, "non_rewarded")
+            data.at[index, "unrewarded_licks"] = (
+                local_unrewarded if pd.notna(local_unrewarded) else count_licks(source, "non_rewarded")
+            )
     return data
 
 
@@ -423,48 +476,81 @@ def _render_session_details(row, subject, context):
 
 
 def _toggle_session_details(session_key):
+    st.session_state["info_alyx_tabs"] = "Sessions"
     state_key = "info_alyx_expanded_session"
     current = st.session_state.get(state_key)
     st.session_state[state_key] = None if current == session_key else session_key
     st.session_state["_info_quick_rerun"] = True
 
 
-def _render_session_list(data, subject, context):
+def _behavior_session_target(row, behavior_data):
+    if behavior_data is None or behavior_data.empty:
+        return None
+    candidates = behavior_data[
+        (behavior_data["Mouse_ID"].astype(str) == str(row.get("mouse_id")))
+        & (pd.to_datetime(behavior_data["Date"], errors="coerce").dt.strftime("%Y-%m-%d") == row.get("date"))
+    ]
+    if len(candidates) > 1 and "Version" in candidates:
+        version = pd.to_numeric(row.get("version"), errors="coerce")
+        candidates = candidates[pd.to_numeric(candidates["Version"], errors="coerce") == version]
+    if len(candidates) != 1:
+        return None
+    selected = candidates.iloc[0]
+    return (str(selected["Mouse_ID"]), row.get("date"), str(selected["Version"]))
+
+
+def _open_behavior_session(target):
+    mouse, date, version = target
+    st.session_state["global_mouse"] = mouse
+    st.session_state["app_active_view"] = "Overview"
+    st.session_state["behavior_tabs"] = "Sessions"
+    st.session_state["behavior_session_jump"] = (mouse, date, version)
+    st.session_state["_scroll_to_top_requested"] = True
+
+
+def _render_session_list(data, subject, context, behavior_data=None):
     for index, row in enumerate(data.to_dict("records")):
         session_key = _text(row.get("session_id"), f"session-{index}")
         expanded_key = "info_alyx_expanded_session"
         expanded = st.session_state.get(expanded_key) == session_key
-        with st.container(border=True, key=f"alyx_session_{index}"):
-            date, protocol, duration, performance, rig, person, details = st.columns(
-                [1.0, 1.25, .85, 2.35, .65, 1.05, .38], vertical_alignment="center"
-            )
-            date.markdown(_row_info("calendar", row.get("date")), unsafe_allow_html=True)
-            protocol.markdown(_row_info(
-                "task", _text(row.get("protocol"), "Protocol unspecified"),
-                row.get("session_probabilities"),
-            ), unsafe_allow_html=True)
-            duration.markdown(_row_info(
-                "result", _number(row.get("session_duration_min"), " min")
-            ), unsafe_allow_html=True)
-            performance.markdown(_row_info(
-                "bouts",
-                f'{_number(row.get("valid_bouts"))} valid · '
-                f'{_number(row.get("rewarded_licks"))} rewarded · '
-                f'{_number(row.get("unrewarded_licks"))} unrewarded',
-            ), unsafe_allow_html=True)
-            rig.markdown(_row_info(
-                "rig", _rig_number(row.get("rig_number"))
-            ), unsafe_allow_html=True)
-            person.markdown(_row_info("user", row.get("experimentalist")), unsafe_allow_html=True)
-            details.button(
-                " ",
-                key=f"toggle_alyx_session_{index}",
-                help="Hide details" if expanded else "Show all session information",
-                on_click=_toggle_session_details,
-                args=(session_key,),
-                type="tertiary",
-                icon=":material/expand_less:" if expanded else ":material/expand_more:",
-            )
+        with st.container(border=True, key=f"alyx_card_{index}"):
+            with st.container(border=False, key=f"alyx_session_header_{index}"):
+                date, protocol, duration, performance, rig, person, behavior, details = st.columns(
+                    [1.0, 1.25, .85, 2.35, .65, 1.05, .38, .38], vertical_alignment="center"
+                )
+                date.markdown(_row_info("calendar", _date_label(row.get("date"))), unsafe_allow_html=True)
+                protocol.markdown(_row_info(
+                    "task", _protocol_label(row.get("protocol")),
+                    row.get("session_probabilities"),
+                ), unsafe_allow_html=True)
+                duration.markdown(_row_info(
+                    "result", _number(row.get("session_duration_min"), " min")
+                ), unsafe_allow_html=True)
+                performance.markdown(_row_info(
+                    "bouts",
+                    f'{_number(row.get("valid_bouts"))} valid bouts, '
+                    f'{_number(row.get("rewarded_licks"))} rewarded licks, '
+                    f'{_lick_reward_rate(row.get("rewarded_licks"), row.get("unrewarded_licks"))} reward rate',
+                ), unsafe_allow_html=True)
+                rig.markdown(_row_info(
+                    "rig", _rig_number(row.get("rig_number"))
+                ), unsafe_allow_html=True)
+                person.markdown(_row_info("user", _person_label(row.get("experimentalist"))), unsafe_allow_html=True)
+                target = _behavior_session_target(row, behavior_data)
+                behavior.button(
+                    " ", icon=":material/open_in_new:", key=f"behavior_alyx_session_{index}",
+                    disabled=target is None, type="tertiary",
+                    on_click=_open_behavior_session, args=(target,),
+                    help="Open Behavior session" if target else "No matching Behavior session",
+                )
+                details.button(
+                    " ",
+                    key=f"toggle_alyx_session_{index}",
+                    on_click=_toggle_session_details,
+                    args=(session_key,),
+                    type="tertiary",
+                    icon=":material/expand_less:" if expanded else ":material/expand_more:",
+                )
             if expanded:
                 _render_session_details(row, subject or {}, context or {})
 
@@ -553,9 +639,131 @@ def _login():
     _authenticate(username, password)
 
 
-def _authenticate(username, password):
+def _recent_info_mice(behavior_data):
+    if behavior_data is None or behavior_data.empty:
+        return ()
+    frame = behavior_data[["Mouse_ID", "Date"]].dropna(subset=["Mouse_ID"]).copy()
+    frame["Mouse_ID"] = frame["Mouse_ID"].astype(str)
+    frame = frame[~frame["Mouse_ID"].isin({"000", "001", "VF000", "VF001"})]
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    dates = frame.groupby("Mouse_ID", sort=True)["Date"].max()
+    return tuple(dates.sort_values(ascending=False, kind="stable", na_position="last").index[:8])
+
+
+class InfoMouseCache:
+    """Only the eight newest mice; older visits never enter this cache."""
+    def __init__(self, client):
+        self.client = client
+        self.entries = {}
+        self.pinned = ()
+        self.lock = RLock()
+        self.requests = Condition()
+        self.active_request = False
+        self.foreground_waiters = 0
+
+    def set_recent(self, mice):
+        with self.lock:
+            self.pinned = tuple(mice[:8])
+            self._trim()
+
+    def _trim(self):
+        older = [mouse for mouse in self.entries if mouse not in self.pinned]
+        for mouse in older:
+            self.entries.pop(mouse, None)
+
+    @contextmanager
+    def _request_slot(self, background):
+        # Serialize Alyx access, but let the selected mouse jump the preload queue.
+        with self.requests:
+            if not background:
+                self.foreground_waiters += 1
+            try:
+                self.requests.wait_for(lambda: not self.active_request and
+                                       (not background or not self.foreground_waiters))
+                self.active_request = True
+            finally:
+                if not background:
+                    self.foreground_waiters -= 1
+        try:
+            yield
+        finally:
+            with self.requests:
+                self.active_request = False
+                self.requests.notify_all()
+
+    def get(self, mouse, refresh=False, on_progress=None, _background=False):
+        mouse = str(mouse)
+        with self.lock:
+            cached = self.entries.get(mouse)
+            if not refresh and cached is not None and cached.get("version") == INFO_CACHE_VERSION:
+                return cached
+        with self._request_slot(_background):
+            cached = self.entries.get(mouse)
+            if not refresh and cached is not None and cached.get("version") == INFO_CACHE_VERSION:
+                return cached
+            cached = {"mouse": mouse, "version": INFO_CACHE_VERSION}
+            if on_progress:
+                on_progress(f"Lecture du profil Alyx de {mouse}…")
+            try:
+                cached["subject"] = self.client.rest("subjects", "read", id=mouse, no_cache=True)
+            except Exception as error:
+                cached["subject"] = None
+                cached["subject_error"] = str(error)
+            if on_progress:
+                on_progress(f"Récupération des sessions de {mouse}…")
+            try:
+                cached["rows"] = normalize_sessions(load_raw_sessions(self.client, DEFAULT_LAB, subject=mouse))
+            except Exception as error:
+                cached["rows"] = None
+                cached["rows_error"] = str(error)
+            if on_progress:
+                on_progress(f"Récupération du suivi de {mouse}…")
+            cached["context"] = _load_mouse_context(self.client, mouse)
+            cached["loaded_at"] = monotonic()
+            with self.lock:
+                if cached["rows"] is not None and mouse in self.pinned:
+                    self.entries[mouse] = cached
+                    self._trim()
+            return cached
+
+    def warm(self, mice, on_progress=None):
+        for index, mouse in enumerate(mice, start=1):
+            with self.lock:
+                if mouse not in self.pinned:
+                    continue
+            if on_progress and mouse not in self.entries:
+                on_progress(f"Préchargement Alyx : {index}/{len(mice)} souris — {mouse}…")
+            self.get(mouse, _background=True)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _configured_info_store(url, username, credential_key, _password):
+    """Shared server account cache, explicitly authorized by the app owner."""
+    return InfoMouseCache(connect(url, username, _password))
+
+
+def _upgrade_info_store(store):
+    """Migrate cached instances after hot reload without reconnecting to Alyx."""
+    with store.lock:
+        if not hasattr(store, "requests"):
+            store.requests = Condition()
+            store.active_request = False
+            store.foreground_waiters = 0
+        if type(store) is not InfoMouseCache:
+            store.__class__ = InfoMouseCache
+            store._trim()
+    return store
+
+
+def _server_info_store(username, password):
+    fingerprint = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return _upgrade_info_store(_configured_info_store(DEFAULT_URL, username, fingerprint, password))
+
+
+def _authenticate(username, password, shared=False):
     try:
-        client = connect(DEFAULT_URL, username, password)
+        store = _server_info_store(username, password) if shared else InfoMouseCache(connect(DEFAULT_URL, username, password))
+        client = store.client
     except ImportError:
         st.session_state["info_alyx_error"] = "Install ONE-api and python-dotenv from requirements.txt to connect."
     except Exception as error:
@@ -567,8 +775,10 @@ def _authenticate(username, password):
     else:
         st.session_state["info_alyx_username"] = username
         st.session_state["info_alyx_client"] = client
+        st.session_state["info_alyx_store"] = store
         st.session_state.pop("info_alyx_error", None)
         st.session_state.pop("info_alyx_data", None)
+        st.session_state.pop("info_alyx_mouse_cache", None)
 
 
 def _logout():
@@ -586,25 +796,39 @@ def _secret_credentials():
         return "", ""
 
 
-def render_info_view(mouse_id, behavior_data=None):
-    st.markdown(INFO_STYLES, unsafe_allow_html=True)
+def prefetch_recent_info(behavior_data):
+    """Preload the approved server account's eight recent mice from Home."""
+    mice = _recent_info_mice(behavior_data)
+    username, password = _secret_credentials()
+    if not mice or not username or not password:
+        return
+    def warm():
+        store = _server_info_store(username, password)
+        store.set_recent(mice)
+        store.warm(mice)
+    credential_key = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    data_prefetcher().submit(("alyx-preload", DEFAULT_URL, username, credential_key, mice), warm)
+
+
+def render_info_view(mouse_id, behavior_data=None, on_progress=None, behavior_details=None):
     if mouse_id is None:
         render_no_data()
         return
-
     username, password = _secret_credentials()
     configured_credentials = bool(username and password)
     if (configured_credentials and "info_alyx_client" not in st.session_state
             and not st.session_state.get("info_alyx_auto_attempted")):
         st.session_state["info_alyx_auto_attempted"] = True
-        with st.spinner("Connecting to Alyx…"):
-            _authenticate(username, password)
+        if on_progress:
+            on_progress("Connexion au serveur Alyx…")
+        with nullcontext():
+            _authenticate(username, password, shared=True)
     client = st.session_state.get("info_alyx_client")
     if client is None:
         if configured_credentials:
             st.caption("Using the Alyx account configured in `.streamlit/secrets.toml`.")
             if st.button("Retry Alyx connection", type="primary"):
-                _authenticate(username, password)
+                _authenticate(username, password, shared=True)
                 st.rerun()
         else:
             st.write("Sign in with your Alyx account to access this mouse's information.")
@@ -617,39 +841,50 @@ def render_info_view(mouse_id, behavior_data=None):
             st.error(st.session_state["info_alyx_error"])
         return
 
-    cached = st.session_state.get("info_alyx_data")
-    if (cached is None or cached.get("mouse") != mouse_id
-            or cached.get("version") != INFO_CACHE_VERSION):
-        cached = {"mouse": mouse_id, "version": INFO_CACHE_VERSION}
-        with st.spinner(f"Reading Alyx information for {mouse_id}…"):
-            try:
-                cached["subject"] = client.rest("subjects", "read", id=str(mouse_id), no_cache=True)
-            except Exception as error:
-                cached["subject"] = None
-                cached["subject_error"] = str(error)
-            try:
-                cached["rows"] = normalize_sessions(load_raw_sessions(client, DEFAULT_LAB, subject=str(mouse_id)))
-            except Exception as error:
-                cached["rows"] = None
-                cached["rows_error"] = str(error)
-            cached["context"] = _load_mouse_context(client, mouse_id)
-        # Failed requests can be retried using Refresh; never show another mouse's data.
-        st.session_state["info_alyx_data"] = cached
+    store = st.session_state.get("info_alyx_store")
+    if store is None:
+        store = _server_info_store(username, password) if configured_credentials else InfoMouseCache(client)
+        st.session_state["info_alyx_store"] = store
+    store = _upgrade_info_store(store)
+    recent_mice = _recent_info_mice(behavior_data)
+    if behavior_data is not None:
+        store.set_recent(recent_mice)
+    cached = store.get(mouse_id, on_progress=on_progress)
+    if recent_mice:
+        data_prefetcher().submit(("alyx-store-preload", id(store), recent_mice),
+                                 lambda: store.warm(recent_mice))
+    st.session_state["info_alyx_mouse_cache"] = store.entries
+    st.session_state["info_alyx_data"] = cached
+
 
     if cached["rows"] is None:
         render_no_data()
         return
     data = pd.DataFrame(cached["rows"], columns=COLUMNS)
-    data = _enrich_behavior_counts(data, behavior_data, mouse_id)
+    data = _enrich_behavior_counts(
+        data, behavior_details if behavior_details is not None else behavior_data, mouse_id
+    )
     if data.empty:
         render_no_data()
         return
     subject = cached["subject"] or {}
-    if subject:
-        st.markdown(_profile_band(mouse_id, subject), unsafe_allow_html=True)
-    sessions_tab, tracking_tab = st.tabs(["Sessions", "Tracking"])
+    _render_info_tabs(data, subject, cached.get("context", {}), behavior_data, mouse_id)
+
+
+@st.fragment
+def _render_info_tabs(data, subject, context, behavior_data, mouse_id):
+    st.html(INFO_STYLES)
+    sessions_tab, tracking_tab = dashboard_tabs(
+        ["Sessions", "Tracking"],
+        key="info_alyx_tabs",
+    )
     with sessions_tab:
-        data = data.sort_values(["date", "session_time"], ascending=False, na_position="last")
-        _render_session_list(data, subject, cached.get("context", {}))
+        if sessions_tab.open:
+            if subject:
+                render_session_info(_profile_values(mouse_id, subject))
+            data = data.sort_values(["date", "session_time"], ascending=False, na_position="last")
+            with st.container(border=False, key="info_sessions_list"):
+                _render_session_list(data, subject, context, behavior_data)
     with tracking_tab:
-        _render_tracking(cached.get("context", {}))
+        if tracking_tab.open:
+            _render_tracking(context)

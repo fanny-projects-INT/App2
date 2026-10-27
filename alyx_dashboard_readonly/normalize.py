@@ -7,6 +7,9 @@ from math import isfinite
 import re
 
 
+NORMALIZE_VERSION = 3
+
+
 COLUMNS = [
     "mouse_id",
     "date",
@@ -110,17 +113,30 @@ def _probabilities(payload, metadata):
         payload.get("probas"),
         payload.get("Probas"),
     )
-    if direct is not None:
-        return str(direct)
     reward = _first(metadata.get("reward_probability"), metadata.get("reward_proba"))
     switch = _first(metadata.get("switch_probability"), metadata.get("switch_proba"))
-    if reward is not None or switch is not None:
-        return f"reward={reward}; switch={switch}"
+
+    def percentage(value):
+        parsed = _number(value)
+        if parsed is None:
+            return None
+        parsed = parsed * 100 if abs(parsed) <= 1 else parsed
+        return str(int(round(parsed))) if float(parsed).is_integer() else f"{parsed:.1f}".rstrip("0").rstrip(".")
+
+    direct_text = str(direct).strip() if direct is not None else ""
+    if "/" in direct_text:
+        normalized = re.sub(r"\s*[;,]\s*", " · ", direct_text)
+        normalized = re.sub(r"\s*[-,]\s*(blue|yellow)\s*$", r" · \1", normalized, flags=re.I)
+        return re.sub(r"\b(blue|yellow)\b", lambda match: match.group(1).title(), normalized)
+    reward_value = percentage(_first(reward, direct))
+    switch_value = percentage(switch)
+    if reward_value is not None and switch_value is not None:
+        return f"{reward_value}/{switch_value}"
     blocks = _dict(metadata.get("blocks"))
     rewards = blocks.get("reward_probabilities")
     switches = blocks.get("switch_probabilities")
-    if rewards or switches:
-        return f"reward={rewards}; switch={switches}"
+    if rewards and switches:
+        return f"{rewards}/{switches}"
     return None
 
 

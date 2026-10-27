@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.feather as feather
 from scipy.ndimage import gaussian_filter1d
 
@@ -17,14 +18,14 @@ def functions(*names):
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     for node in nodes:
         node.decorator_list = []
-    namespace = dict(np=np, pd=pd, feather=feather, Path=Path, json=json,
+    namespace = dict(np=np, pd=pd, pa=pa, feather=feather, Path=Path, json=json,
                      gaussian_filter1d=gaussian_filter1d)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), namespace)
     return namespace
 
 class PerformanceRegressionTests(unittest.TestCase):
     def test_replay_selects_exact_row_and_version_without_changing_values(self):
-        ns = functions('load_behavior_replay_table', 'load_behavior_video_session')
+        ns = functions('read_behavior_rows', 'load_behavior_replay_table', 'load_behavior_video_session')
         tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
         helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'load_behavior_replay_table')
         columns = ast.literal_eval(helper.body[1].value)

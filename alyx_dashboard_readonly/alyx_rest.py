@@ -54,11 +54,14 @@ def _day(value):
         return None
 
 
-def _poop_actions(client, lab: str) -> dict[tuple[str, str], list[dict]]:
+def _poop_actions(client, lab: str, subject: str | None = None) -> dict[tuple[str, str], list[dict]]:
     """Return poop actions when the optional companion endpoint is available."""
     if "other-actions" not in client.rest_schemes.endpoints:
         return {}
-    actions = client.rest("other-actions", "list", lab=lab, no_cache=True)
+    filters = {"lab": lab}
+    if subject is not None:
+        filters["subject"] = subject
+    actions = client.rest("other-actions", "list", no_cache=True, **filters)
     grouped = defaultdict(list)
     for action in actions:
         procedures = {str(value).strip().lower() for value in action.get("procedures", [])}
@@ -80,7 +83,7 @@ def load_raw_sessions(client, lab: str = DEFAULT_LAB, subject: str | None = None
     if subject is not None:
         filters["subject"] = subject
     summaries = client.rest("sessions", "list", no_cache=True, **filters)
-    poop_by_subject_day = _poop_actions(client, lab)
+    poop_by_subject_day = _poop_actions(client, lab, subject)
     rows = []
     for summary in summaries:
         detail = client.rest(

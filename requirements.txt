@@ -10,3 +10,6 @@ openai
 imageio-ffmpeg
 ONE-api>=3.5,<4
 python-dotenv>=1.0,<2
+tifffile
+
+ibl-neuropixel>=1.14,<2

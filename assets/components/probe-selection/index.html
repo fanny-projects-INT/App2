@@ -1,0 +1,59 @@
+<!doctype html><html><head><meta charset="utf-8"><script src="plotly.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;color:#263548}
+.layout{display:grid;grid-template-columns:2.1fr 1fr;gap:16px;align-items:start}
+#brain{height:720px;min-width:0;background:#111b2a}#cards{display:flex;flex-direction:column;gap:16px;padding:0 2px}
+button{display:grid;grid-template-columns:30fr 12fr 26fr 26fr;align-items:center;width:100%;height:42px;padding:0 10px;border:1px solid #e1e7ec;border-left:4px solid var(--color);border-radius:10px;background:rgba(255,255,255,.68);color:#263548;font-size:12px;cursor:pointer}
+button.selected,button:hover{background:#fff4f1;border-top-color:#f04f47;border-right-color:#f04f47;border-bottom-color:#f04f47;color:#d84740}
+button span{text-align:center;white-space:nowrap}button.selected{font-weight:650}
+@media(max-width:700px){.layout{grid-template-columns:1fr}#brain{height:500px}#cards{gap:8px}}
+</style></head><body><div class="layout"><div id="brain"></div><div id="cards"></div></div>
+<script>
+const brain=document.getElementById('brain'),cards=document.getElementById('cards');
+let ready=false,selected=null,sessions=[],camera=null,storageKey=null,queue=Promise.resolve();
+function remember(){try{sessionStorage.setItem(storageKey,JSON.stringify({selected,camera}));}catch(e){}}
+function send(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*');}
+function mark(){for(const button of cards.children)button.classList.toggle('selected',button.dataset.date===selected);}
+function highlight(){
+ const indices=[],opacity=[],sizes=[],markerOpacity=[],widths=[],texts=[];
+ brain.data.forEach((trace,i)=>{
+  if(!trace.legendgroup)return;
+  const active=trace.legendgroup===selected,entry=trace.mode==='markers+text';
+  indices.push(i);opacity.push(entry?1:(trace.hoverinfo==='skip'?(active?.72:.14):(active?1:.58)));
+  sizes.push(active?12:3.5);markerOpacity.push(active?1:.62);widths.push(active?3:1);
+  const match=(trace.hovertemplate||'').match(/(probe\d+)/);
+  texts.push([entry&&active&&match?match[1]:'']);
+ });
+ return Plotly.restyle(brain,{opacity,'marker.size':sizes,'marker.opacity':markerOpacity,
+                             'marker.line.width':widths,text:texts},indices);
+}
+function buttons(){cards.replaceChildren();for(const item of sessions){
+ const button=document.createElement('button');button.type='button';button.dataset.date=item.date;button.style.setProperty('--color',item.color);
+ for(const value of [item.date,item.probes.length+'P',(item.good||'-')+' units',(item.bouts??'-')+' bouts']){const span=document.createElement('span');span.textContent=value;button.append(span);}
+ button.onclick=()=>{if(selected===item.date)return;selected=item.date;remember();mark();
+  queue=queue.then(async()=>{await highlight();send('streamlit:setComponentValue',{value:{date:selected}});})
+             .catch(error=>console.error('Probe selection update failed',error));};cards.append(button);
+ }mark();}
+window.addEventListener('message',event=>{
+ if(event.data.type!=='streamlit:render')return;
+ const args=event.data.args;
+ queue=queue.then(async()=>{
+  // A backend acknowledgement must never restore an older selection or rebuild the scene.
+  if(ready){send('streamlit:setFrameHeight',{height:Math.max(brain.offsetHeight,cards.offsetHeight)+4});return;}
+  sessions=args.sessions;selected=args.selected;storageKey=args.storage_key;
+  try{const saved=JSON.parse(sessionStorage.getItem(storageKey)||'null');if(saved){camera=saved.camera;if(sessions.some(s=>s.date===saved.selected))selected=saved.selected;}}catch(e){}
+  buttons();
+  const layout={...args.figure.layout,autosize:true,title:{text:''},uirevision:'persistent-camera'};
+  delete layout.width;
+  if(camera)layout.scene={...layout.scene,camera};
+  const config={responsive:true,scrollZoom:true,displaylogo:false,modeBarButtonsToRemove:['select2d','lasso2d']};
+  if(!ready){await Plotly.newPlot(brain,args.figure.data,layout,config);ready=true;await highlight();
+   brain.on('plotly_relayout',event=>{if(event['scene.camera']){camera=event['scene.camera'];remember();}});
+  }
+  send('streamlit:setFrameHeight',{height:Math.max(brain.offsetHeight,cards.offsetHeight)+4});
+ });
+});
+window.addEventListener('resize',()=>{if(ready)Plotly.Plots.resize(brain);});
+if(typeof ResizeObserver!=='undefined'){new ResizeObserver(()=>{if(ready&&brain.clientWidth>0)Plotly.Plots.resize(brain);}).observe(brain);}
+send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',{height:724});
+</script></body></html>

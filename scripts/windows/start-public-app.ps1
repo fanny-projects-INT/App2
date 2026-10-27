@@ -1,10 +1,10 @@
 $ErrorActionPreference = "Stop"
 
-$appDirectory = $PSScriptRoot
+$appDirectory = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $streamlitExecutable = Join-Path $appDirectory ".venv\Scripts\streamlit.exe"
 $appFile = Join-Path $appDirectory "app.py"
 $healthUrl = "http://127.0.0.1:8501/_stcore/health"
-$publicUrl = "https://cazette-lab.org"
+$publicUrl = "https://cazettes-lab.com"
 $logDirectory = Join-Path $appDirectory "logs"
 
 if (-not (Test-Path -LiteralPath $streamlitExecutable)) {
@@ -63,9 +63,47 @@ if ($null -eq $tunnelService) {
     Write-Warning "The permanent Cloudflare tunnel service is not installed yet."
     Write-Host "The dashboard is available locally at http://127.0.0.1:8501" -ForegroundColor Cyan
 } elseif ($tunnelService.Status -ne "Running") {
-    Write-Warning "The Cloudflare tunnel service is installed but is not running."
+    Write-Host "Starting the public tunnel..." -ForegroundColor Cyan
+    try {
+        Start-Service -Name "cloudflared" -ErrorAction Stop
+    } catch {
+        # Elevate only the service operation; Streamlit stays under the current user.
+        $serviceCommand = "Start-Service -Name 'cloudflared' -ErrorAction Stop"
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($serviceCommand))
+        $serviceStarter = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @("-NoProfile", "-EncodedCommand", $encodedCommand) `
+            -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+        if ($serviceStarter.ExitCode -ne 0) {
+            throw "The public tunnel could not be started."
+        }
+    }
+    $tunnelService = Get-Service -Name "cloudflared"
+    $tunnelService.WaitForStatus("Running", [TimeSpan]::FromSeconds(20))
+    Write-Host "Public address: $publicUrl" -ForegroundColor Cyan
 } else {
     Write-Host "Cloudflare tunnel service is running." -ForegroundColor Green
     Write-Host "Public address: $publicUrl" -ForegroundColor Cyan
+}
+
+if ($null -ne $tunnelService -and (Get-Service -Name "cloudflared").Status -eq "Running") {
+    Write-Host "Waiting for the public address..." -ForegroundColor Cyan
+    $publicReady = $false
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        try {
+            $publicHealth = Invoke-WebRequest -Uri "$publicUrl/_stcore/health" -UseBasicParsing -TimeoutSec 3
+            if ($publicHealth.StatusCode -eq 200 -and $publicHealth.Content.Trim() -eq "ok") {
+                $publicReady = $true
+                break
+            }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not $publicReady) {
+        throw "The app is running locally, but the public tunnel is not ready. Check logs\cloudflared.log."
+    }
+    Start-Process -FilePath $publicUrl
+} else {
+    Start-Process -FilePath "http://127.0.0.1:8501"
 }
 
